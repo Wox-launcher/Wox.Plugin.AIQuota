@@ -7,7 +7,7 @@
   "Name": "i18n:plugin_name",
   "Description": "i18n:plugin_desc",
   "Author": "Wox-launcher",
-  "Version": "0.2.1",
+  "Version": "0.2.2",
   "MinWoxVersion": "2.0.0",
   "Runtime": "nodejs",
   "Website": "https://github.com/Wox-launcher/Wox.Plugin.CodexUsage",

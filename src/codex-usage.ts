@@ -84,7 +84,7 @@ interface AppServerSnapshot {
   rateLimits: RateLimitsInfo | null
 }
 
-interface JsonRpcRequest {
+export interface JsonRpcRequest {
   id: string
   method: string
   params?: unknown
@@ -99,7 +99,7 @@ interface JsonRpcResponse {
   }
 }
 
-interface JsonRpcSessionResponse {
+export interface JsonRpcSessionResponse {
   result?: unknown
   error?: {
     code?: number
@@ -342,7 +342,7 @@ async function runJsonRpcSession(executable: string, timeoutMs: number, requests
   throw lastError || new Error("Unable to start Codex app-server")
 }
 
-async function runJsonRpcSessionWithLaunchSpec(launchSpec: CommandLaunchSpec, timeoutMs: number, requests: JsonRpcRequest[]): Promise<Record<string, JsonRpcSessionResponse>> {
+export async function runJsonRpcSessionWithLaunchSpec(launchSpec: CommandLaunchSpec, timeoutMs: number, requests: JsonRpcRequest[]): Promise<Record<string, JsonRpcSessionResponse>> {
   return new Promise((resolve, reject) => {
     const child = spawn(launchSpec.command, launchSpec.args, launchSpec.options)
 
@@ -439,6 +439,23 @@ async function runJsonRpcSessionWithLaunchSpec(launchSpec: CommandLaunchSpec, ti
       responseMap[response.id] = response.error !== undefined ? { error: response.error } : { result: response.result }
       delete pendingIds[response.id]
 
+      if (response.id === "initialize") {
+        if (response.error !== undefined) {
+          for (let index = 0; index < requests.length; index += 1) {
+            if (requests[index].id !== "initialize") {
+              delete pendingIds[requests[index].id]
+            }
+          }
+        } else {
+          child.stdin.write(JSON.stringify({ method: "initialized" }) + "\n")
+          for (let index = 0; index < requests.length; index += 1) {
+            if (requests[index].id !== "initialize") {
+              child.stdin.write(JSON.stringify(requests[index]) + "\n")
+            }
+          }
+        }
+      }
+
       if (Object.keys(pendingIds).length === 0) {
         finishWithSuccess()
       }
@@ -451,10 +468,24 @@ async function runJsonRpcSessionWithLaunchSpec(launchSpec: CommandLaunchSpec, ti
       }
     })
 
+    let sentInitializeRequest = false
     for (let index = 0; index < requests.length; index += 1) {
-      child.stdin.write(JSON.stringify(requests[index]) + "\n")
+      if (requests[index].id === "initialize") {
+        sentInitializeRequest = true
+        child.stdin.write(JSON.stringify(requests[index]) + "\n")
+      }
     }
-    child.stdin.end()
+
+    if (!sentInitializeRequest) {
+      for (let index = 0; index < requests.length; index += 1) {
+        child.stdin.write(JSON.stringify(requests[index]) + "\n")
+      }
+      child.stdin.end()
+    }
+
+    if (Object.keys(pendingIds).length === 0) {
+      finishWithSuccess()
+    }
   })
 }
 
