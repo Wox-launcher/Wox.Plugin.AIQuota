@@ -3,7 +3,7 @@ import { PassThrough } from "stream"
 
 import { spawn } from "child_process"
 
-import { runJsonRpcSessionWithLaunchSpec } from "./codex-usage"
+import { listCodexWindows, resolveCodexWindowLabel, runJsonRpcSessionWithLaunchSpec } from "./codex-usage"
 
 jest.mock("child_process", () => ({
   execFile: jest.fn(),
@@ -129,7 +129,7 @@ describe("runJsonRpcSessionWithLaunchSpec", () => {
           method: "initialize",
           params: {
             clientInfo: {
-              name: "wox-plugin-codex-usage-test",
+              name: "wox-plugin-ai-quota-test",
               version: "0.0.0"
             }
           }
@@ -159,5 +159,66 @@ describe("runJsonRpcSessionWithLaunchSpec", () => {
       }
     })
     expect(fakeServer.seenMethods).toEqual(["initialize", "initialized", "account/read", "account/rateLimits/read"])
+  })
+})
+
+describe("resolveCodexWindowLabel", () => {
+  const now = Date.UTC(2026, 8, 8, 9, 0, 0)
+
+  test("labels a 5-hour window when reset is still inside that window", () => {
+    expect(
+      resolveCodexWindowLabel(
+        {
+          usedPercent: 12,
+          windowDurationMins: 300,
+          resetsAt: now / 1000 + 3 * 3600
+        },
+        undefined,
+        now
+      )
+    ).toBe("5H")
+  })
+
+  test("relabels a misleading 5-hour window as weekly when reset is days away", () => {
+    expect(
+      resolveCodexWindowLabel(
+        {
+          usedPercent: 12,
+          windowDurationMins: 300,
+          resetsAt: now / 1000 + 6 * 86400 + 18 * 3600
+        },
+        undefined,
+        now
+      )
+    ).toBe("Week")
+  })
+
+  test("uses the weekly duration when Codex reports a week window", () => {
+    expect(
+      resolveCodexWindowLabel(
+        {
+          usedPercent: 12,
+          windowDurationMins: 10080,
+          resetsAt: now / 1000 + 6 * 86400
+        },
+        undefined,
+        now
+      )
+    ).toBe("Week")
+  })
+
+  test("lists only windows that exist", () => {
+    expect(
+      listCodexWindows({
+        primary: {
+          usedPercent: 12,
+          windowDurationMins: 10080,
+          resetsAt: 1
+        },
+        secondary: null,
+        credits: null,
+        planType: "pro"
+      })
+    ).toHaveLength(1)
   })
 })

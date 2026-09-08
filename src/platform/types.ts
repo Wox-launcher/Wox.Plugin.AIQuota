@@ -4,6 +4,8 @@ export interface RuntimeSettings {
   codexExecutable: string
   codexHome: string
   sqliteExecutable: string
+  cursorStateDbPath: string
+  grokHome: string
   requestTimeoutMs: number
 }
 

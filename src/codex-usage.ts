@@ -1,17 +1,15 @@
-import { execFile, spawn } from "child_process"
+import { spawn } from "child_process"
 import { access, readFile } from "fs/promises"
 import { join } from "path"
 import { createInterface } from "readline"
-import { promisify } from "util"
 
 import { Context, PublicAPI } from "@wox-launcher/wox-plugin"
 
 import { getPlatformRuntime } from "./platform"
 import { CommandLaunchSpec, RuntimeSettings } from "./platform/types"
+import { ensureError, runSqliteQuery, shouldTryNextCommand } from "./sqlite"
 
-const execFileAsync = promisify(execFile)
-
-const PLUGIN_CLIENT_NAME = "wox-plugin-codex-usage"
+const PLUGIN_CLIENT_NAME = "wox-plugin-ai-quota"
 const PLUGIN_VERSION = "0.1.0"
 
 const DEFAULT_CACHE_TTL_SECONDS = 15
@@ -744,8 +742,8 @@ async function readLocalUsage(settings: RuntimeSettings): Promise<LocalUsageSumm
   const summaryQuery = "select count(*), sum(case when archived = 0 then 1 else 0 end), coalesce(sum(tokens_used), 0), coalesce(max(updated_at), 0) from threads;"
   const sourcesQuery = "select source, count(*), coalesce(sum(tokens_used), 0) from threads group by source order by coalesce(sum(tokens_used), 0) desc;"
 
-  const summaryResult = await runSqliteExecFile(settings.sqliteExecutable, [databasePath, summaryQuery], settings.requestTimeoutMs)
-  const sourcesResult = await runSqliteExecFile(settings.sqliteExecutable, [databasePath, sourcesQuery], settings.requestTimeoutMs)
+  const summaryResult = await runSqliteQuery(settings.sqliteExecutable, [databasePath, summaryQuery], settings.requestTimeoutMs)
+  const sourcesResult = await runSqliteQuery(settings.sqliteExecutable, [databasePath, sourcesQuery], settings.requestTimeoutMs)
 
   const summaryLine = firstNonEmptyLine(summaryResult.stdout)
   if (summaryLine === null) {
@@ -803,32 +801,6 @@ async function readNumberSetting(api: PublicAPI, ctx: Context, key: string, fall
   }
 
   return Math.floor(parsed)
-}
-
-async function runExecFile(command: string, args: string[], timeoutMs: number): Promise<{ stdout: string; stderr: string }> {
-  return execFileAsync(command, args, {
-    encoding: "utf8",
-    timeout: timeoutMs,
-    maxBuffer: 1024 * 1024
-  })
-}
-
-async function runSqliteExecFile(command: string, args: string[], timeoutMs: number): Promise<{ stdout: string; stderr: string }> {
-  const candidates = platformRuntime.getSqliteExecutableCandidates(command)
-  let lastError: Error | null = null
-
-  for (let index = 0; index < candidates.length; index += 1) {
-    try {
-      return await runExecFile(candidates[index], args, timeoutMs)
-    } catch (error) {
-      lastError = ensureError(error)
-      if (!shouldTryNextCommand(lastError, index, candidates.length)) {
-        throw lastError
-      }
-    }
-  }
-
-  throw lastError || new Error("Unable to run sqlite command")
 }
 
 async function log(api: PublicAPI, ctx: Context, level: "Info" | "Warning" | "Error" | "Debug", message: string): Promise<void> {
@@ -908,23 +880,6 @@ function toErrorMessage(error: unknown): string {
   return String(error)
 }
 
-function ensureError(error: unknown): Error {
-  if (error instanceof Error) {
-    return error
-  }
-
-  return new Error(String(error))
-}
-
-function shouldTryNextCommand(error: Error, index: number, total: number): boolean {
-  if (index >= total - 1) {
-    return false
-  }
-
-  const message = error.message.toLowerCase()
-  return message.indexOf("enoent") >= 0 || message.indexOf("spawn") >= 0 || message.indexOf("not recognized as an internal or external command") >= 0 || message.indexOf("cannot find the file") >= 0
-}
-
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null
 }
@@ -937,26 +892,95 @@ export function formatPlanType(planType: string | null): string {
   return planType.charAt(0).toUpperCase() + planType.slice(1)
 }
 
+export interface CodexWindowLabels {
+  week: string
+  day: string
+  fiveHour: string
+  hourSuffix: string
+  minuteSuffix: string
+  fallback: string
+}
+
+const DEFAULT_WINDOW_LABELS: CodexWindowLabels = {
+  week: "Week",
+  day: "Day",
+  fiveHour: "5H",
+  hourSuffix: "h",
+  minuteSuffix: "m",
+  fallback: "Limit"
+}
+
+export function listCodexWindows(rateLimits: RateLimitsInfo | null): RateLimitWindowInfo[] {
+  if (rateLimits === null) {
+    return []
+  }
+
+  const windows: RateLimitWindowInfo[] = []
+  if (rateLimits.primary !== null) {
+    windows.push(rateLimits.primary)
+  }
+  if (rateLimits.secondary !== null) {
+    windows.push(rateLimits.secondary)
+  }
+
+  return windows
+}
+
+export function resolveCodexWindowLabel(window: RateLimitWindowInfo, labels?: CodexWindowLabels, nowMs?: number): string {
+  const resolvedLabels = labels || DEFAULT_WINDOW_LABELS
+  const minutes = resolveEffectiveWindowMinutes(window, nowMs)
+  if (minutes === null) {
+    return resolvedLabels.fallback
+  }
+
+  return formatWindowMinutes(minutes, resolvedLabels)
+}
+
+export function resolveEffectiveWindowMinutes(window: RateLimitWindowInfo, nowMs?: number): number | null {
+  const duration = window.windowDurationMins
+  const resetMins = window.resetsAt !== null ? (window.resetsAt * 1000 - (nowMs !== undefined ? nowMs : Date.now())) / 60000 : null
+
+  if (duration !== null && resetMins !== null && resetMins > duration * 2 + 60) {
+    return resetMins
+  }
+
+  if (duration !== null) {
+    return duration
+  }
+
+  if (resetMins !== null && resetMins > 0) {
+    return resetMins
+  }
+
+  return null
+}
+
 export function formatWindowLabel(window: RateLimitWindowInfo | null, fallback: string): string {
-  if (window === null || window.windowDurationMins === null) {
+  if (window === null) {
     return fallback
   }
 
-  if (window.windowDurationMins % 10080 === 0) {
-    const weeks = window.windowDurationMins / 10080
-    return weeks === 1 ? "Weekly" : String(weeks) + "w"
+  return resolveCodexWindowLabel(window, {
+    ...DEFAULT_WINDOW_LABELS,
+    fallback: fallback
+  })
+}
+
+function formatWindowMinutes(mins: number, labels: CodexWindowLabels): string {
+  if (mins >= 7200 || mins % 10080 === 0) {
+    return labels.week
   }
 
-  if (window.windowDurationMins % 1440 === 0) {
-    const days = window.windowDurationMins / 1440
-    return days === 1 ? "Daily" : String(days) + "d"
+  if (mins % 1440 === 0 || (mins >= 1200 && mins < 7200)) {
+    return labels.day
   }
 
-  if (window.windowDurationMins % 60 === 0) {
-    return String(window.windowDurationMins / 60) + "h"
+  if (mins % 60 === 0) {
+    const hours = mins / 60
+    return hours === 5 ? labels.fiveHour : String(hours) + labels.hourSuffix
   }
 
-  return String(window.windowDurationMins) + "m"
+  return String(Math.max(1, Math.round(mins))) + labels.minuteSuffix
 }
 
 export function formatResetTime(epochSeconds: number | null): string {
