@@ -13,8 +13,20 @@ import {
   shouldShowCursorResult,
   shouldShowGrokBotResult
 } from "./cursor-usage"
+import {
+  CachedClaudeUsageProvider,
+  ClaudeExtraUsage,
+  ClaudeUsageProvider,
+  ClaudeUsageSnapshot,
+  ClaudeUsageWindow,
+  formatUsdFromCents as formatClaudeUsdFromCents,
+  getClaudeExtraRemainingPercent,
+  getClaudeRemainingPercent,
+  listClaudeDisplayWindows,
+  shouldShowClaudeResult
+} from "./claude-usage"
 import { CachedGrokUsageProvider, getGrokRemainingPercent, GrokPeriodType, GrokUsageProvider, GrokUsageSnapshot, shouldShowGrokResult } from "./grok-usage"
-import { CODEX_ICON, CURSOR_ICON, GROK_BOT_ICON, GROK_ICON } from "./icons"
+import { CLAUDE_ICON, CODEX_ICON, CURSOR_ICON, GROK_BOT_ICON, GROK_ICON } from "./icons"
 
 interface LocaleStrings {
   subtitleNoLiveData: string
@@ -40,6 +52,12 @@ interface LocaleStrings {
   grokNoLiveData: string
   grokNotSignedIn: string
   grokNotFound: string
+  claudeNoLiveData: string
+  claudeNotSignedIn: string
+  claudeNotFound: string
+  claudeExtraUsage: string
+  windowClaudeSession: string
+  windowClaudeWeek: string
   windowGrokBuild: string
   windowGrokChat: string
   windowGrokBot: string
@@ -75,6 +93,12 @@ const DEFAULT_LOCALE_STRINGS: LocaleStrings = {
   grokNoLiveData: "No live Grok usage data",
   grokNotSignedIn: "Run grok login on this machine",
   grokNotFound: "Grok CLI is not installed on this machine",
+  claudeNoLiveData: "No live Claude usage data",
+  claudeNotSignedIn: "Sign in to Claude Code on this machine",
+  claudeNotFound: "Claude Code is not installed on this machine",
+  claudeExtraUsage: "Extra %s / %s",
+  windowClaudeSession: "Session",
+  windowClaudeWeek: "Week",
   windowGrokBuild: "Build",
   windowGrokChat: "Chat",
   windowGrokBot: "Bot",
@@ -91,11 +115,13 @@ export class AIQuotaPlugin implements Plugin {
   private provider: UsageProvider
   private cursorProvider: CursorUsageProvider
   private grokProvider: GrokUsageProvider
+  private claudeProvider: ClaudeUsageProvider
 
-  constructor(provider?: UsageProvider, cursorProvider?: CursorUsageProvider, grokProvider?: GrokUsageProvider) {
+  constructor(provider?: UsageProvider, cursorProvider?: CursorUsageProvider, grokProvider?: GrokUsageProvider, claudeProvider?: ClaudeUsageProvider) {
     this.provider = provider || new CachedCodexUsageProvider()
     this.cursorProvider = cursorProvider || new CachedCursorUsageProvider()
     this.grokProvider = grokProvider || new CachedGrokUsageProvider()
+    this.claudeProvider = claudeProvider || new CachedClaudeUsageProvider()
     this.init = this.init.bind(this)
     this.query = this.query.bind(this)
   }
@@ -105,6 +131,7 @@ export class AIQuotaPlugin implements Plugin {
     await this.provider.start(ctx, this.api)
     await this.cursorProvider.start(ctx, this.api)
     await this.grokProvider.start(ctx, this.api)
+    await this.claudeProvider.start(ctx, this.api)
     await safeLog(this.api, ctx, "Info", "AI Quota plugin initialized")
   }
 
@@ -144,6 +171,21 @@ export class AIQuotaPlugin implements Plugin {
       }
     }
 
+    if (includesProvider(filter, "claude")) {
+      try {
+        const snapshot = forceRefresh ? await this.claudeProvider.refresh(ctx, this.api) : await this.claudeProvider.getSnapshot(ctx, this.api)
+        if (shouldShowClaudeResult(snapshot, filter)) {
+          results.push(...(await buildClaudeResults(snapshot, this.api, ctx, this.claudeProvider)))
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        await safeLog(this.api, ctx, "Error", "Failed to read Claude usage: " + message)
+        if (filter === "claude") {
+          results.push(buildClaudeErrorResult(message, this.api, ctx, this.claudeProvider))
+        }
+      }
+    }
+
     if (includesProvider(filter, "grok")) {
       try {
         const snapshot = forceRefresh ? await this.grokProvider.refresh(ctx, this.api) : await this.grokProvider.getSnapshot(ctx, this.api)
@@ -177,7 +219,7 @@ export function shouldForceRefresh(search: string): boolean {
   return normalized === "refresh" || normalized === "reload" || normalized.endsWith(" refresh") || normalized.endsWith(" reload")
 }
 
-export type UsageFilter = "all" | "codex" | "cursor" | "grok"
+export type UsageFilter = "all" | "codex" | "cursor" | "grok" | "claude"
 
 export function includesProvider(filter: UsageFilter, provider: Exclude<UsageFilter, "all">): boolean {
   return filter === "all" || filter === provider
@@ -197,6 +239,10 @@ export function resolveUsageFilter(query: Pick<Query, "Search"> & { Command?: st
     return "grok"
   }
 
+  if (command === "claude") {
+    return "claude"
+  }
+
   const search = query.Search.trim().toLowerCase()
   if (search === "cursor" || search.startsWith("cursor ")) {
     return "cursor"
@@ -208,6 +254,10 @@ export function resolveUsageFilter(query: Pick<Query, "Search"> & { Command?: st
 
   if (search === "grok" || search.startsWith("grok ")) {
     return "grok"
+  }
+
+  if (search === "claude" || search.startsWith("claude ")) {
+    return "claude"
   }
 
   return "all"
@@ -229,6 +279,22 @@ export async function buildResults(snapshot: CodexUsageSnapshot, api: PublicAPI,
       Score: 100,
       Tails: buildOverviewTails(snapshot, strings),
       Actions: commonActions
+    }
+  ]
+}
+
+export async function buildClaudeResults(snapshot: ClaudeUsageSnapshot, api: PublicAPI, ctx: Context, provider: ClaudeUsageProvider): Promise<Result[]> {
+  const strings = await readLocaleStrings(api, ctx)
+
+  return [
+    {
+      Id: "claude-usage-overview",
+      Title: "i18n:claude_result_title",
+      SubTitle: buildClaudeSubtitle(snapshot, strings),
+      Icon: CLAUDE_ICON,
+      Score: 95,
+      Tails: buildClaudeTails(snapshot, strings),
+      Actions: buildClaudeActions(api, ctx, provider)
     }
   ]
 }
@@ -300,6 +366,103 @@ function buildOverviewSubtitle(snapshot: CodexUsageSnapshot, strings: LocaleStri
   }
 
   return parts.join(" | ")
+}
+
+function buildClaudeSubtitle(snapshot: ClaudeUsageSnapshot, strings: LocaleStrings): string {
+  if (snapshot.availability === "unavailable") {
+    if (snapshot.warnings.indexOf("not-signed-in") >= 0) {
+      return strings.claudeNotSignedIn
+    }
+
+    if (snapshot.warnings.indexOf("claude-not-found") >= 0) {
+      return strings.claudeNotFound
+    }
+
+    return snapshot.warnings.length > 0 ? snapshot.warnings[0] : strings.claudeNoLiveData
+  }
+
+  if (snapshot.availability === "error") {
+    return snapshot.warnings.length > 0 ? snapshot.warnings[0] : strings.claudeNoLiveData
+  }
+
+  const planName = snapshot.planName !== null ? snapshot.planName : "Claude"
+  const parts: string[] = []
+  const windows = listClaudeDisplayWindows(snapshot.windows)
+
+  for (let index = 0; index < windows.length; index += 1) {
+    parts.push(formatTemplate(strings.subtitleResetIn, claudeWindowLabel(windows[index], strings), formatRelativeResetAt(windows[index].resetsAt, strings)))
+  }
+
+  const extra = formatClaudeExtraUsage(snapshot.extraUsage, strings)
+  if (extra !== null) {
+    parts.push(extra)
+  }
+
+  if (parts.length === 0) {
+    parts.push(strings.claudeNoLiveData)
+  }
+
+  if (snapshot.warnings.length > 0) {
+    parts.push(strings.subtitleFallback)
+  }
+
+  return planName + " · " + parts.join(" | ")
+}
+
+function formatClaudeExtraUsage(extraUsage: ClaudeExtraUsage | null, strings: LocaleStrings): string | null {
+  if (extraUsage === null || !extraUsage.enabled) {
+    return null
+  }
+
+  if (extraUsage.usedCents === null && extraUsage.limitCents === null) {
+    return null
+  }
+
+  const used = extraUsage.usedCents !== null ? formatClaudeUsdFromCents(extraUsage.usedCents) : "--"
+  const limit = extraUsage.limitCents !== null ? formatClaudeUsdFromCents(extraUsage.limitCents) : "--"
+  return formatTemplate(strings.claudeExtraUsage, used, limit)
+}
+
+function claudeWindowLabel(window: ClaudeUsageWindow, strings: LocaleStrings): string {
+  if (window.kind === "session") {
+    return strings.windowClaudeSession
+  }
+
+  if (window.kind === "weekly") {
+    return strings.windowClaudeWeek
+  }
+
+  return window.label
+}
+
+function buildClaudeTails(snapshot: ClaudeUsageSnapshot, strings: LocaleStrings): ResultTail[] {
+  const tails: ResultTail[] = []
+  const windows = listClaudeDisplayWindows(snapshot.windows)
+
+  for (let index = 0; index < windows.length && tails.length < 3; index += 1) {
+    tails.push(buildRemainingProgressTail(claudeBarLabel(windows[index], strings), getClaudeRemainingPercent(windows[index].usedPercent)))
+  }
+
+  if (tails.length === 0) {
+    const remaining = getClaudeExtraRemainingPercent(snapshot.extraUsage)
+    if (remaining !== null) {
+      tails.push(buildRemainingProgressTail(strings.windowLimit, remaining))
+    }
+  }
+
+  return tails
+}
+
+function claudeBarLabel(window: ClaudeUsageWindow, strings: LocaleStrings): string {
+  if (window.kind === "session") {
+    return strings.windowFiveHour
+  }
+
+  if (window.kind === "weekly") {
+    return strings.windowClaudeWeek
+  }
+
+  return window.label
 }
 
 function buildGrokSubtitle(snapshot: GrokUsageSnapshot, strings: LocaleStrings): string {
@@ -541,6 +704,33 @@ function buildCursorActions(api: PublicAPI, ctx: Context, provider: CursorUsageP
   ]
 }
 
+function buildClaudeActions(api: PublicAPI, ctx: Context, provider: ClaudeUsageProvider): ResultAction[] {
+  return [
+    {
+      Id: "refresh-claude",
+      Name: "i18n:action_refresh",
+      Icon: {
+        ImageType: "svg",
+        ImageData: `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24"><path fill="#0c4cf0" d="M12 20q-3.35 0-5.675-2.325T4 12t2.325-5.675T12 4q1.725 0 3.3.712T18 6.75V4h2v7h-7V9h4.2q-.8-1.4-2.187-2.2T12 6Q9.5 6 7.75 7.75T6 12t1.75 4.25T12 18q1.925 0 3.475-1.1T17.65 14h2.1q-.7 2.65-2.85 4.325T12 20"/></svg>`
+      },
+      PreventHideAfterAction: true,
+      Action: async actionCtx => {
+        await safeLog(api, ctx, "Info", "Refreshing Claude usage")
+        try {
+          await provider.refresh(ctx, api)
+        } catch (error) {
+          await safeLog(api, ctx, "Warning", "Manual Claude usage refresh failed: " + (error instanceof Error ? error.message : String(error)))
+        }
+        if (typeof api.RefreshQuery === "function") {
+          await api.RefreshQuery(actionCtx, {
+            PreserveSelectedIndex: true
+          })
+        }
+      }
+    }
+  ]
+}
+
 function buildGrokActions(api: PublicAPI, ctx: Context, provider: GrokUsageProvider): ResultAction[] {
   return [
     {
@@ -624,6 +814,47 @@ function buildCursorErrorResult(message: string, api: PublicAPI, ctx: Context, p
             await provider.refresh(ctx, api)
           } catch (error) {
             await safeLog(api, ctx, "Warning", "Cursor usage retry failed: " + (error instanceof Error ? error.message : String(error)))
+          }
+          if (typeof api.RefreshQuery === "function") {
+            await api.RefreshQuery(actionCtx, {
+              PreserveSelectedIndex: false
+            })
+          }
+        }
+      }
+    ]
+  }
+}
+
+function buildClaudeErrorResult(message: string, api: PublicAPI, ctx: Context, provider: ClaudeUsageProvider): Result {
+  return {
+    Id: "claude-usage-error",
+    Title: "i18n:claude_error_title",
+    SubTitle: message,
+    Icon: CLAUDE_ICON,
+    Score: 95,
+    Actions: [
+      {
+        Id: "copy-claude-error",
+        Name: "i18n:action_copy_error",
+        IsDefault: true,
+        Action: async actionCtx => {
+          await api.Copy(actionCtx, {
+            type: "text",
+            text: message
+          })
+        }
+      },
+      {
+        Id: "refresh-claude-error",
+        Name: "i18n:action_retry",
+        PreventHideAfterAction: true,
+        Action: async actionCtx => {
+          await safeLog(api, ctx, "Warning", "Retrying Claude usage fetch after error")
+          try {
+            await provider.refresh(ctx, api)
+          } catch (error) {
+            await safeLog(api, ctx, "Warning", "Claude usage retry failed: " + (error instanceof Error ? error.message : String(error)))
           }
           if (typeof api.RefreshQuery === "function") {
             await api.RefreshQuery(actionCtx, {
@@ -833,6 +1064,12 @@ async function readLocaleStrings(api: PublicAPI, ctx: Context): Promise<LocaleSt
     grokNoLiveData: await translate(api, ctx, "grok_no_live_data", DEFAULT_LOCALE_STRINGS.grokNoLiveData),
     grokNotSignedIn: await translate(api, ctx, "grok_not_signed_in", DEFAULT_LOCALE_STRINGS.grokNotSignedIn),
     grokNotFound: await translate(api, ctx, "grok_not_found", DEFAULT_LOCALE_STRINGS.grokNotFound),
+    claudeNoLiveData: await translate(api, ctx, "claude_no_live_data", DEFAULT_LOCALE_STRINGS.claudeNoLiveData),
+    claudeNotSignedIn: await translate(api, ctx, "claude_not_signed_in", DEFAULT_LOCALE_STRINGS.claudeNotSignedIn),
+    claudeNotFound: await translate(api, ctx, "claude_not_found", DEFAULT_LOCALE_STRINGS.claudeNotFound),
+    claudeExtraUsage: await translate(api, ctx, "claude_extra_usage", DEFAULT_LOCALE_STRINGS.claudeExtraUsage),
+    windowClaudeSession: await translate(api, ctx, "window_claude_session", DEFAULT_LOCALE_STRINGS.windowClaudeSession),
+    windowClaudeWeek: await translate(api, ctx, "window_claude_week", DEFAULT_LOCALE_STRINGS.windowClaudeWeek),
     windowGrokBuild: await translate(api, ctx, "window_grok_build", DEFAULT_LOCALE_STRINGS.windowGrokBuild),
     windowGrokChat: await translate(api, ctx, "window_grok_chat", DEFAULT_LOCALE_STRINGS.windowGrokChat),
     windowGrokBot: await translate(api, ctx, "window_grok_bot", DEFAULT_LOCALE_STRINGS.windowGrokBot),

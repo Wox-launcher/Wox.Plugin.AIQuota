@@ -10,6 +10,7 @@ export function createRuntimeSettings(codexExecutable: string, sqliteExecutable:
     sqliteExecutable: sqliteExecutable,
     cursorStateDbPath: resolveCursorStateDbPath(process.platform, process.env, homedir()),
     grokHome: resolveGrokHome(process.env, homedir()),
+    claudeHome: resolveClaudeHome(process.env, homedir()),
     requestTimeoutMs: requestTimeoutMs
   }
 }
@@ -34,4 +35,13 @@ export function resolveGrokHome(env: NodeJS.ProcessEnv, home: string): string {
   }
 
   return join(home, ".grok")
+}
+
+export function resolveClaudeHome(env: NodeJS.ProcessEnv, home: string): string {
+  const override = env.CLAUDE_CONFIG_DIR
+  if (typeof override === "string" && override.trim().length > 0) {
+    return override.trim()
+  }
+
+  return join(home, ".claude")
 }

@@ -306,7 +306,7 @@ function createUnavailableSnapshot(warnings: string[]): CursorUsageSnapshot {
   }
 }
 
-export function shouldShowCursorResult(snapshot: CursorUsageSnapshot, filter: "all" | "codex" | "cursor" | "grok"): boolean {
+export function shouldShowCursorResult(snapshot: CursorUsageSnapshot, filter: "all" | "codex" | "cursor" | "grok" | "claude"): boolean {
   if (filter === "cursor") {
     return true
   }
@@ -706,7 +706,7 @@ export function readSandUsage(value: unknown): CursorSandUsage | null {
   }
 }
 
-export function shouldShowGrokBotResult(snapshot: CursorUsageSnapshot | null, filter: "all" | "codex" | "cursor" | "grok"): boolean {
+export function shouldShowGrokBotResult(snapshot: CursorUsageSnapshot | null, filter: "all" | "codex" | "cursor" | "grok" | "claude"): boolean {
   if (snapshot === null || snapshot.sandUsage === null) {
     return false
   }

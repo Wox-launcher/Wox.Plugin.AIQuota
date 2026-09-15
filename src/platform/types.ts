@@ -6,6 +6,7 @@ export interface RuntimeSettings {
   sqliteExecutable: string
   cursorStateDbPath: string
   grokHome: string
+  claudeHome: string
   requestTimeoutMs: number
 }
 

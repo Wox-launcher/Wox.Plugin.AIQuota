@@ -266,7 +266,7 @@ function createUnavailableGrokSnapshot(warnings: string[]): GrokUsageSnapshot {
   }
 }
 
-export function shouldShowGrokResult(snapshot: GrokUsageSnapshot, filter: "all" | "codex" | "cursor" | "grok"): boolean {
+export function shouldShowGrokResult(snapshot: GrokUsageSnapshot, filter: "all" | "codex" | "cursor" | "grok" | "claude"): boolean {
   if (filter === "grok") {
     return true
   }
