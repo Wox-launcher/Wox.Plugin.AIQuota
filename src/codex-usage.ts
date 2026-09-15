@@ -54,8 +54,11 @@ export interface LocalUsageSummary {
   bySource: LocalUsageSourceSummary[]
 }
 
+export type CodexAvailability = "pending" | "ready"
+
 export interface CodexUsageSnapshot {
   fetchedAt: number
+  availability: CodexAvailability
   source: "app-server" | "local-fallback"
   userAgent: string | null
   account: AccountInfo | null
@@ -142,11 +145,7 @@ export class CachedCodexUsageProvider implements UsageProvider {
       return this.cache.snapshot
     }
 
-    if (this.inflight === null) {
-      this.triggerBackgroundRefresh(ctx, api)
-    }
-
-    return createEmptySnapshot()
+    return this.refresh(ctx, api)
   }
 
   private async loadSnapshot(ctx: Context, api: PublicAPI): Promise<CodexUsageSnapshot> {
@@ -187,6 +186,7 @@ export class CachedCodexUsageProvider implements UsageProvider {
 
     return {
       fetchedAt: Date.now(),
+      availability: "ready",
       source: rateLimits !== null ? "app-server" : "local-fallback",
       userAgent: appServer !== null ? appServer.userAgent : null,
       account: account,
@@ -267,9 +267,10 @@ function getRuntimeSettings(): RuntimeSettings {
   return platformRuntime.getRuntimeSettings(DEFAULT_REQUEST_TIMEOUT_MS)
 }
 
-function createEmptySnapshot(): CodexUsageSnapshot {
+export function createEmptyCodexSnapshot(): CodexUsageSnapshot {
   return {
     fetchedAt: Date.now(),
+    availability: "pending",
     source: "local-fallback",
     userAgent: null,
     account: null,
@@ -277,6 +278,14 @@ function createEmptySnapshot(): CodexUsageSnapshot {
     local: null,
     warnings: []
   }
+}
+
+export function shouldShowCodexResult(snapshot: CodexUsageSnapshot, filter: "all" | "codex" | "cursor" | "grok" | "claude"): boolean {
+  if (snapshot.availability === "pending") {
+    return false
+  }
+
+  return filter === "all" || filter === "codex"
 }
 
 async function readFromAppServer(settings: RuntimeSettings): Promise<AppServerSnapshot> {
@@ -890,6 +899,21 @@ export function formatPlanType(planType: string | null): string {
   }
 
   return planType.charAt(0).toUpperCase() + planType.slice(1)
+}
+
+export function resolveCodexPlanName(snapshot: Pick<CodexUsageSnapshot, "account" | "rateLimits">): string | null {
+  const fromLimits = snapshot.rateLimits !== null ? snapshot.rateLimits.planType : null
+  const fromAccount = snapshot.account !== null ? snapshot.account.planType : null
+  const raw = fromLimits !== null && fromLimits.length > 0 ? fromLimits : fromAccount
+  if (raw !== null && raw.length > 0) {
+    return formatPlanType(raw)
+  }
+
+  if (snapshot.account !== null && snapshot.account.mode === "apiKey") {
+    return "API Key"
+  }
+
+  return null
 }
 
 export interface CodexWindowLabels {

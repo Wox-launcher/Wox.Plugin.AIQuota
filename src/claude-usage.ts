@@ -129,11 +129,7 @@ export class CachedClaudeUsageProvider implements ClaudeUsageProvider {
       return this.cache.snapshot
     }
 
-    if (this.inflight === null) {
-      this.triggerBackgroundRefresh(ctx, api)
-    }
-
-    return createEmptyClaudeSnapshot()
+    return this.refresh(ctx, api)
   }
 
   async refresh(ctx: Context, api: PublicAPI): Promise<ClaudeUsageSnapshot> {
@@ -267,6 +263,10 @@ function createUnavailableClaudeSnapshot(warnings: string[]): ClaudeUsageSnapsho
 }
 
 export function shouldShowClaudeResult(snapshot: ClaudeUsageSnapshot, filter: "all" | "codex" | "cursor" | "grok" | "claude"): boolean {
+  if (snapshot.availability === "pending") {
+    return false
+  }
+
   if (filter === "claude") {
     return true
   }
@@ -435,9 +435,10 @@ export function listClaudeDisplayWindows(windows: ClaudeUsageWindow[]): ClaudeUs
     result.push(weekly)
   }
 
-  const scoped = pickScopedWindow(windows)
-  if (scoped !== null) {
-    result.push(scoped)
+  const scoped = scopedWindows(windows)
+  scoped.sort((left, right) => right.usedPercent - left.usedPercent)
+  for (let index = 0; index < scoped.length; index += 1) {
+    result.push(scoped[index])
   }
 
   return result
@@ -1047,22 +1048,6 @@ function scopedWindows(windows: ClaudeUsageWindow[]): ClaudeUsageWindow[] {
   }
 
   return result
-}
-
-function pickScopedWindow(windows: ClaudeUsageWindow[]): ClaudeUsageWindow | null {
-  const scoped = scopedWindows(windows)
-  if (scoped.length === 0) {
-    return null
-  }
-
-  let selected = scoped[0]
-  for (let index = 1; index < scoped.length; index += 1) {
-    if (scoped[index].usedPercent > selected.usedPercent) {
-      selected = scoped[index]
-    }
-  }
-
-  return selected
 }
 
 function normalizeWindowPercents(windows: ClaudeUsageWindow[]): ClaudeUsageWindow[] {

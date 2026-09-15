@@ -3,7 +3,7 @@ import { PassThrough } from "stream"
 
 import { spawn } from "child_process"
 
-import { listCodexWindows, resolveCodexWindowLabel, runJsonRpcSessionWithLaunchSpec } from "./codex-usage"
+import { createEmptyCodexSnapshot, listCodexWindows, resolveCodexPlanName, resolveCodexWindowLabel, runJsonRpcSessionWithLaunchSpec, shouldShowCodexResult } from "./codex-usage"
 
 jest.mock("child_process", () => ({
   execFile: jest.fn(),
@@ -220,5 +220,52 @@ describe("resolveCodexWindowLabel", () => {
         planType: "pro"
       })
     ).toHaveLength(1)
+  })
+})
+
+describe("shouldShowCodexResult", () => {
+  test("hides pending Codex results until the first fetch finishes", () => {
+    const pending = createEmptyCodexSnapshot()
+    const ready = { ...pending, availability: "ready" as const }
+
+    expect(shouldShowCodexResult(pending, "all")).toBe(false)
+    expect(shouldShowCodexResult(pending, "codex")).toBe(false)
+    expect(shouldShowCodexResult(ready, "all")).toBe(true)
+    expect(shouldShowCodexResult(ready, "codex")).toBe(true)
+    expect(shouldShowCodexResult(ready, "cursor")).toBe(false)
+  })
+})
+
+describe("resolveCodexPlanName", () => {
+  test("prefers the rate-limit plan type", () => {
+    expect(
+      resolveCodexPlanName({
+        account: { mode: "chatgpt", planType: "plus" },
+        rateLimits: {
+          primary: null,
+          secondary: null,
+          credits: null,
+          planType: "pro"
+        }
+      })
+    ).toBe("Pro")
+  })
+
+  test("falls back to the chatgpt account plan", () => {
+    expect(
+      resolveCodexPlanName({
+        account: { mode: "chatgpt", planType: "plus" },
+        rateLimits: null
+      })
+    ).toBe("Plus")
+  })
+
+  test("labels api-key accounts when no plan is present", () => {
+    expect(
+      resolveCodexPlanName({
+        account: { mode: "apiKey", planType: null },
+        rateLimits: null
+      })
+    ).toBe("API Key")
   })
 })

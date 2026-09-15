@@ -135,11 +135,7 @@ export class CachedCursorUsageProvider implements CursorUsageProvider {
       return this.cache.snapshot
     }
 
-    if (this.inflight === null) {
-      this.triggerBackgroundRefresh(ctx, api)
-    }
-
-    return createEmptyCursorSnapshot()
+    return this.refresh(ctx, api)
   }
 
   async refresh(ctx: Context, api: PublicAPI): Promise<CursorUsageSnapshot> {
@@ -307,6 +303,10 @@ function createUnavailableSnapshot(warnings: string[]): CursorUsageSnapshot {
 }
 
 export function shouldShowCursorResult(snapshot: CursorUsageSnapshot, filter: "all" | "codex" | "cursor" | "grok" | "claude"): boolean {
+  if (snapshot.availability === "pending") {
+    return false
+  }
+
   if (filter === "cursor") {
     return true
   }
@@ -707,7 +707,7 @@ export function readSandUsage(value: unknown): CursorSandUsage | null {
 }
 
 export function shouldShowGrokBotResult(snapshot: CursorUsageSnapshot | null, filter: "all" | "codex" | "cursor" | "grok" | "claude"): boolean {
-  if (snapshot === null || snapshot.sandUsage === null) {
+  if (snapshot === null || snapshot.availability === "pending" || snapshot.sandUsage === null) {
     return false
   }
 

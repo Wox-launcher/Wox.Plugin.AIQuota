@@ -175,7 +175,7 @@ describe("claude display helpers", () => {
     expect(shortModelLabel("Sonnet")).toBe("Sonnet")
   })
 
-  test("keeps session, week, and the highest scoped window for display", () => {
+  test("lists session, week, and every scoped window for split results", () => {
     const windows = listClaudeDisplayWindows([
       { kind: "session", label: "Session", usedPercent: 15, resetsAt: 1 },
       { kind: "weekly", label: "Week", usedPercent: 40, resetsAt: 2 },
@@ -183,10 +183,10 @@ describe("claude display helpers", () => {
       { kind: "scoped", label: "Opus", usedPercent: 60, resetsAt: 4 }
     ])
 
-    expect(windows.map(window => window.label)).toEqual(["Session", "Week", "Opus"])
+    expect(windows.map(window => window.label)).toEqual(["Session", "Week", "Opus", "Haiku"])
   })
 
-  test("hides pending claude results unless the query asked for claude", () => {
+  test("hides pending claude results until the first fetch finishes", () => {
     const pending = {
       fetchedAt: 1,
       availability: "pending" as const,
@@ -198,7 +198,7 @@ describe("claude display helpers", () => {
     }
 
     expect(shouldShowClaudeResult(pending, "all")).toBe(false)
-    expect(shouldShowClaudeResult(pending, "claude")).toBe(true)
+    expect(shouldShowClaudeResult(pending, "claude")).toBe(false)
     expect(shouldShowClaudeResult({ ...pending, availability: "ready" }, "all")).toBe(true)
   })
 

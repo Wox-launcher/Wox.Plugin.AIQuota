@@ -1,6 +1,6 @@
 import { join } from "path"
 
-import { formatGrokPlanName, getGrokRemainingPercent, readGrokAuthFile, readGrokBilling, readGrokSettings, shouldShowGrokResult } from "./grok-usage"
+import { formatGrokPlanName, getGrokRemainingPercent, isGrokAccessExpired, mergeGrokAuth, readGrokAuthFile, readGrokBilling, readGrokSettings, shouldShowGrokResult } from "./grok-usage"
 import { includesProvider, resolveUsageFilter } from "./index"
 import { resolveGrokHome } from "./platform/shared"
 
@@ -53,10 +53,76 @@ describe("readGrokAuthFile", () => {
     expect(auth?.email).toBe("user@example.com")
     expect(auth?.authMode).toBe("supergrok")
     expect(auth?.accessToken).toBe("supergrok-token")
+    expect(auth?.entryKey).toBe("https://auth.x.ai::client")
+  })
+
+  test("reads the OIDC refresh fields used by grok login", () => {
+    const auth = readGrokAuthFile({
+      "https://auth.x.ai::b1a00492-073a-47ea-816f-4c329264a828": {
+        key: "access-token",
+        auth_mode: "oidc",
+        refresh_token: "refresh-token",
+        expires_at: "2026-09-15T20:36:14.692406900Z",
+        oidc_issuer: "https://auth.x.ai",
+        oidc_client_id: "b1a00492-073a-47ea-816f-4c329264a828"
+      }
+    })
+
+    expect(auth).not.toBeNull()
+    expect(auth?.refreshToken).toBe("refresh-token")
+    expect(auth?.issuer).toBe("https://auth.x.ai")
+    expect(auth?.clientId).toBe("b1a00492-073a-47ea-816f-4c329264a828")
+    expect(auth?.expiresAt).toBe(Math.floor(Date.parse("2026-09-15T20:36:14.692Z") / 1000))
   })
 
   test("returns null when no bearer token is present", () => {
     expect(readGrokAuthFile({ email: "user@example.com" })).toBeNull()
+  })
+})
+
+describe("mergeGrokAuth", () => {
+  test("updates the matching OIDC entry without dropping other fields", () => {
+    const merged = mergeGrokAuth(
+      {
+        "https://auth.x.ai::client": {
+          key: "old-access",
+          auth_mode: "oidc",
+          email: "user@example.com",
+          refresh_token: "old-refresh"
+        }
+      },
+      {
+        accessToken: "new-access",
+        refreshToken: "new-refresh",
+        email: "user@example.com",
+        authMode: "oidc",
+        expiresAt: 1789504574,
+        clientId: "client",
+        issuer: "https://auth.x.ai",
+        entryKey: "https://auth.x.ai::client"
+      }
+    )
+
+    expect(merged["https://auth.x.ai::client"]).toEqual({
+      key: "new-access",
+      auth_mode: "oidc",
+      email: "user@example.com",
+      refresh_token: "new-refresh",
+      expires_at: "2026-09-15T20:36:14.000Z"
+    })
+  })
+})
+
+describe("isGrokAccessExpired", () => {
+  test("uses expires_at when present", () => {
+    expect(isGrokAccessExpired({ accessToken: "token", expiresAt: 100 }, 0, 99999)).toBe(false)
+    expect(isGrokAccessExpired({ accessToken: "token", expiresAt: 100 }, 0, 100000)).toBe(true)
+  })
+
+  test("falls back to the JWT exp claim", () => {
+    const token = ["eyJhbGciOiJub25lIn0", Buffer.from(JSON.stringify({ exp: 100 })).toString("base64url"), "sig"].join(".")
+    expect(isGrokAccessExpired({ accessToken: token, expiresAt: null }, 0, 99000)).toBe(false)
+    expect(isGrokAccessExpired({ accessToken: token, expiresAt: null }, 0, 100000)).toBe(true)
   })
 })
 
@@ -70,7 +136,7 @@ describe("grok display helpers", () => {
     expect(formatGrokPlanName(null)).toBe("SuperGrok")
   })
 
-  test("hides pending grok results unless the query asked for grok", () => {
+  test("hides pending grok results until the first fetch finishes", () => {
     const pending = {
       fetchedAt: 1,
       availability: "pending" as const,
@@ -89,7 +155,7 @@ describe("grok display helpers", () => {
     }
 
     expect(shouldShowGrokResult(pending, "all")).toBe(false)
-    expect(shouldShowGrokResult(pending, "grok")).toBe(true)
+    expect(shouldShowGrokResult(pending, "grok")).toBe(false)
     expect(shouldShowGrokResult({ ...pending, availability: "ready" }, "all")).toBe(true)
   })
 })

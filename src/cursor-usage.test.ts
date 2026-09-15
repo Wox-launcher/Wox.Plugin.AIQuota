@@ -208,7 +208,7 @@ describe("cursor display helpers", () => {
     ).toBe(42)
   })
 
-  test("hides pending cursor results unless the query asked for cursor", () => {
+  test("hides pending cursor results until the first fetch finishes", () => {
     const pending = {
       fetchedAt: 1,
       availability: "pending" as const,
@@ -228,8 +228,9 @@ describe("cursor display helpers", () => {
     }
 
     expect(shouldShowCursorResult(pending, "all")).toBe(false)
-    expect(shouldShowCursorResult(pending, "cursor")).toBe(true)
+    expect(shouldShowCursorResult(pending, "cursor")).toBe(false)
     expect(shouldShowCursorResult({ ...pending, availability: "ready" }, "all")).toBe(true)
+    expect(shouldShowGrokBotResult({ ...pending, sandUsage: { usagePercent: 10, periodStart: null, resetAt: null } }, "all")).toBe(false)
   })
 })
 

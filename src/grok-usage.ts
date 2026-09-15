@@ -1,5 +1,5 @@
 import { request as httpsRequest } from "https"
-import { access, readFile } from "fs/promises"
+import { access, readFile, rename, unlink, writeFile } from "fs/promises"
 import { join } from "path"
 import { URL } from "url"
 
@@ -10,8 +10,11 @@ import { RuntimeSettings } from "./platform/types"
 
 const DEFAULT_CACHE_TTL_SECONDS = 15
 const DEFAULT_REQUEST_TIMEOUT_MS = 8000
+const TOKEN_EXPIRY_SKEW_MS = 120000
 const BILLING_URL = "https://cli-chat-proxy.grok.com/v1/billing?format=credits"
 const SETTINGS_URL = "https://cli-chat-proxy.grok.com/v1/settings"
+const OIDC_ISSUER = "https://auth.x.ai"
+const OIDC_CLIENT_ID = "b1a00492-073a-47ea-816f-4c329264a828"
 const platformRuntime = getPlatformRuntime()
 
 export type GrokAvailability = "pending" | "unavailable" | "ready" | "error"
@@ -53,15 +56,20 @@ interface UsageQueryOptions {
 
 interface GrokAuth {
   accessToken: string
+  refreshToken: string | null
   email: string | null
   authMode: string | null
   expiresAt: number | null
+  clientId: string | null
+  issuer: string | null
+  entryKey: string | null
 }
 
 interface JsonRequestOptions {
   method: "GET" | "POST"
   url: string
   headers?: Record<string, string>
+  body?: string
   timeoutMs: number
 }
 
@@ -107,11 +115,7 @@ export class CachedGrokUsageProvider implements GrokUsageProvider {
       return this.cache.snapshot
     }
 
-    if (this.inflight === null) {
-      this.triggerBackgroundRefresh(ctx, api)
-    }
-
-    return createEmptyGrokSnapshot()
+    return this.refresh(ctx, api)
   }
 
   async refresh(ctx: Context, api: PublicAPI): Promise<GrokUsageSnapshot> {
@@ -143,7 +147,7 @@ export class CachedGrokUsageProvider implements GrokUsageProvider {
     }
 
     try {
-      const remote = await fetchGrokRemote(auth.accessToken, runtimeSettings.requestTimeoutMs)
+      const remote = await fetchGrokUsage(auth, authPath, runtimeSettings.requestTimeoutMs)
       return {
         fetchedAt: Date.now(),
         availability: "ready",
@@ -267,6 +271,10 @@ function createUnavailableGrokSnapshot(warnings: string[]): GrokUsageSnapshot {
 }
 
 export function shouldShowGrokResult(snapshot: GrokUsageSnapshot, filter: "all" | "codex" | "cursor" | "grok" | "claude"): boolean {
+  if (snapshot.availability === "pending") {
+    return false
+  }
+
   if (filter === "grok") {
     return true
   }
@@ -286,31 +294,72 @@ export function readGrokAuthFile(value: unknown): GrokAuth | null {
 
   for (let index = 0; index < candidates.length; index += 1) {
     const entry = value[candidates[index]]
-    const auth = readGrokAuthEntry(entry)
+    const auth = readGrokAuthEntry(entry, candidates[index])
     if (auth !== null) {
       return auth
     }
   }
 
-  return readGrokAuthEntry(value)
+  return readGrokAuthEntry(value, null)
 }
 
-function readGrokAuthEntry(value: unknown): GrokAuth | null {
+function readGrokAuthEntry(value: unknown, entryKey: string | null): GrokAuth | null {
   if (!isRecord(value)) {
     return null
   }
 
-  const accessToken = typeof value.key === "string" ? value.key.trim() : typeof value.access_token === "string" ? value.access_token.trim() : ""
-  if (accessToken.length === 0) {
+  const accessToken = firstString(value, ["key", "access_token"])
+  if (accessToken === null) {
     return null
   }
 
+  const clientId = firstString(value, ["oidc_client_id", "client_id"])
   return {
     accessToken: accessToken,
-    email: typeof value.email === "string" ? value.email : null,
-    authMode: typeof value.auth_mode === "string" ? value.auth_mode : null,
-    expiresAt: readExpiresAt(value.expires_at)
+    refreshToken: firstString(value, ["refresh_token", "refreshToken"]),
+    email: firstString(value, ["email"]),
+    authMode: firstString(value, ["auth_mode", "authMode"]),
+    expiresAt: readExpiresAt(value.expires_at !== undefined ? value.expires_at : value.expiresAt),
+    clientId: clientId !== null ? clientId : clientIdFromEntryKey(entryKey),
+    issuer: firstString(value, ["oidc_issuer", "issuer"]),
+    entryKey: entryKey
   }
+}
+
+export function mergeGrokAuth(raw: Record<string, unknown>, auth: GrokAuth): Record<string, unknown> {
+  const expiresAt = auth.expiresAt !== null ? new Date(auth.expiresAt * 1000).toISOString() : undefined
+  const nextEntry: Record<string, unknown> = {}
+
+  if (auth.entryKey !== null && isRecord(raw[auth.entryKey])) {
+    Object.assign(nextEntry, raw[auth.entryKey])
+  } else if (auth.entryKey === null) {
+    Object.assign(nextEntry, raw)
+  }
+
+  nextEntry.key = auth.accessToken
+  if (auth.refreshToken !== null) {
+    nextEntry.refresh_token = auth.refreshToken
+  }
+  if (expiresAt !== undefined) {
+    nextEntry.expires_at = expiresAt
+  }
+
+  if (auth.entryKey === null) {
+    return nextEntry
+  }
+
+  return {
+    ...raw,
+    [auth.entryKey]: nextEntry
+  }
+}
+
+export function isGrokAccessExpired(auth: Pick<GrokAuth, "accessToken" | "expiresAt">, skewMs: number, nowMs = Date.now()): boolean {
+  if (auth.expiresAt !== null) {
+    return auth.expiresAt * 1000 <= nowMs + skewMs
+  }
+
+  return isJwtExpired(auth.accessToken, skewMs, nowMs)
 }
 
 export function readGrokBilling(value: unknown): {
@@ -394,6 +443,42 @@ export function formatGrokPlanName(value: string | null): string | null {
   return value
 }
 
+async function fetchGrokUsage(
+  auth: GrokAuth,
+  filePath: string,
+  timeoutMs: number
+): Promise<{
+  planName: string | null
+  periodType: GrokPeriodType
+  creditUsagePercent: number | null
+  billingCycleStart: number | null
+  billingCycleEnd: number | null
+  prepaidBalanceCents: number | null
+  onDemandUsedCents: number | null
+  onDemandCapCents: number | null
+  productUsage: GrokProductUsage[]
+  warnings: string[]
+}> {
+  let current = auth
+  let refreshed = false
+
+  if (isGrokAccessExpired(current, TOKEN_EXPIRY_SKEW_MS) && current.refreshToken !== null) {
+    current = await refreshGrokOauth(current, filePath, timeoutMs)
+    refreshed = true
+  }
+
+  try {
+    return await fetchGrokRemote(current.accessToken, timeoutMs)
+  } catch (error) {
+    if (refreshed || current.refreshToken === null || !isGrokSessionExpiredError(error)) {
+      throw error
+    }
+
+    const next = await refreshGrokOauth(current, filePath, timeoutMs)
+    return fetchGrokRemote(next.accessToken, timeoutMs)
+  }
+}
+
 async function fetchGrokRemote(
   token: string,
   timeoutMs: number
@@ -431,6 +516,105 @@ async function fetchGrokRemote(
   }
 }
 
+async function refreshGrokOauth(auth: GrokAuth, filePath: string, timeoutMs: number): Promise<GrokAuth> {
+  if (auth.refreshToken === null) {
+    throw new Error("Grok session expired; run grok login")
+  }
+
+  const clientId = auth.clientId !== null ? auth.clientId : OIDC_CLIENT_ID
+  const issuer = auth.issuer !== null ? auth.issuer.replace(/\/+$/, "") : OIDC_ISSUER
+  const response = await requestJson({
+    method: "POST",
+    url: issuer + "/oauth2/token",
+    headers: {
+      Accept: "application/json",
+      "Content-Type": "application/x-www-form-urlencoded"
+    },
+    body: encodeForm({
+      grant_type: "refresh_token",
+      client_id: clientId,
+      refresh_token: auth.refreshToken
+    }),
+    timeoutMs: timeoutMs
+  })
+
+  if (response.status === 400 || response.status === 401) {
+    const latest = await rereadGrokAuth(filePath)
+    if (latest !== null && latest.accessToken !== auth.accessToken) {
+      return latest
+    }
+
+    throw new Error("Grok session expired; run grok login")
+  }
+
+  if (response.status < 200 || response.status >= 300 || !isRecord(response.json)) {
+    throw new Error("Unable to refresh Grok session")
+  }
+
+  const accessToken = firstString(response.json, ["access_token", "accessToken"])
+  if (accessToken === null) {
+    throw new Error("Unable to refresh Grok session")
+  }
+
+  const refreshToken = firstString(response.json, ["refresh_token", "refreshToken"])
+  const expiresIn = readNumber(response.json.expires_in)
+  const next: GrokAuth = {
+    ...auth,
+    accessToken: accessToken,
+    refreshToken: refreshToken !== null ? refreshToken : auth.refreshToken,
+    expiresAt: Math.floor(Date.now() / 1000) + (expiresIn !== null ? expiresIn : 3600)
+  }
+
+  await persistGrokAuth(filePath, next, auth)
+  return next
+}
+
+async function persistGrokAuth(filePath: string, auth: GrokAuth, expected: GrokAuth): Promise<void> {
+  try {
+    const latestRaw = JSON.parse(await readFile(filePath, "utf8")) as unknown
+    const latest = readGrokAuthFile(latestRaw)
+    if (latest !== null && latest.accessToken !== expected.accessToken && latest.accessToken !== auth.accessToken) {
+      return
+    }
+
+    if (!isRecord(latestRaw)) {
+      return
+    }
+
+    await writeJsonAtomic(filePath, mergeGrokAuth(latestRaw, auth))
+  } catch (error) {
+    if (toErrorMessage(error).indexOf("Grok session expired") >= 0) {
+      throw error
+    }
+  }
+}
+
+async function rereadGrokAuth(filePath: string): Promise<GrokAuth | null> {
+  try {
+    return readGrokAuthFile(JSON.parse(await readFile(filePath, "utf8")) as unknown)
+  } catch {
+    return null
+  }
+}
+
+async function writeJsonAtomic(filePath: string, value: unknown): Promise<void> {
+  const tempPath = filePath + ".tmp-" + String(process.pid)
+  try {
+    await writeFile(tempPath, JSON.stringify(value, null, 2) + "\n", {
+      encoding: "utf8",
+      mode: 0o600
+    })
+    await rename(tempPath, filePath)
+  } catch (error) {
+    try {
+      await unlink(tempPath)
+    } catch {
+      // The temp file may never have been created.
+    }
+    throw error
+  }
+}
+
 async function getJson(url: string, token: string, timeoutMs: number): Promise<JsonResponse> {
   return requestJson({
     method: "GET",
@@ -462,6 +646,10 @@ function readOptionalApiJson(response: JsonResponse): unknown {
   }
 
   return response.json
+}
+
+function isGrokSessionExpiredError(error: unknown): boolean {
+  return toErrorMessage(error).indexOf("Grok session expired") >= 0
 }
 
 function readPeriodType(value: unknown, start: number | null, end: number | null): GrokPeriodType {
@@ -568,6 +756,7 @@ function readNumber(value: unknown): number | null {
 async function requestJson(options: JsonRequestOptions): Promise<JsonResponse> {
   return new Promise((resolve, reject) => {
     const url = new URL(options.url)
+    const body = options.body !== undefined ? Buffer.from(options.body, "utf8") : null
     const headers: Record<string, string | number> = {
       Accept: "application/json",
       "User-Agent": "wox-plugin-ai-quota/0.4.0"
@@ -578,6 +767,10 @@ async function requestJson(options: JsonRequestOptions): Promise<JsonResponse> {
       for (let index = 0; index < headerKeys.length; index += 1) {
         headers[headerKeys[index]] = options.headers[headerKeys[index]]
       }
+    }
+
+    if (body !== null) {
+      headers["Content-Length"] = body.length
     }
 
     const req = httpsRequest(
@@ -623,6 +816,10 @@ async function requestJson(options: JsonRequestOptions): Promise<JsonResponse> {
     req.setTimeout(options.timeoutMs, () => {
       req.destroy(new Error("Timed out while waiting for Grok API"))
     })
+
+    if (body !== null) {
+      req.write(body)
+    }
 
     req.end()
   })
@@ -677,6 +874,67 @@ function toErrorMessage(error: unknown): string {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null
+}
+
+function firstString(value: Record<string, unknown>, keys: string[]): string | null {
+  for (let index = 0; index < keys.length; index += 1) {
+    const item = value[keys[index]]
+    if (typeof item === "string" && item.trim().length > 0) {
+      return item.trim()
+    }
+  }
+
+  return null
+}
+
+function encodeForm(fields: Record<string, string>): string {
+  const keys = Object.keys(fields)
+  const parts: string[] = []
+  for (let index = 0; index < keys.length; index += 1) {
+    parts.push(encodeURIComponent(keys[index]) + "=" + encodeURIComponent(fields[keys[index]]))
+  }
+
+  return parts.join("&")
+}
+
+function clientIdFromEntryKey(entryKey: string | null): string | null {
+  if (entryKey === null) {
+    return null
+  }
+
+  const marker = "::"
+  const index = entryKey.lastIndexOf(marker)
+  if (index < 0) {
+    return null
+  }
+
+  const clientId = entryKey.slice(index + marker.length).trim()
+  return clientId.length > 0 ? clientId : null
+}
+
+function isJwtExpired(token: string, skewMs: number, nowMs = Date.now()): boolean {
+  const parts = token.split(".")
+  if (parts.length < 2) {
+    return false
+  }
+
+  try {
+    const normalized = parts[1].replace(/-/g, "+").replace(/_/g, "/")
+    const padded = normalized + "===".slice((normalized.length + 3) % 4)
+    const payload = JSON.parse(Buffer.from(padded, "base64").toString("utf8")) as unknown
+    if (!isRecord(payload)) {
+      return false
+    }
+
+    const expiresAt = readNumber(payload.exp)
+    if (expiresAt === null) {
+      return false
+    }
+
+    return expiresAt * 1000 <= nowMs + skewMs
+  } catch {
+    return false
+  }
 }
 
 function clamp(value: number, min: number, max: number): number {

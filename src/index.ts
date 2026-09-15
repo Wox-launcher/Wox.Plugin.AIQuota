@@ -1,6 +1,6 @@
 import { Context, Plugin, PluginInitParams, PublicAPI, Query, Result, ResultAction, ResultTail } from "@wox-launcher/wox-plugin"
 
-import { CachedCodexUsageProvider, CodexUsageSnapshot, CodexWindowLabels, listCodexWindows, RateLimitWindowInfo, resolveCodexWindowLabel, UsageProvider } from "./codex-usage"
+import { CachedCodexUsageProvider, CodexUsageSnapshot, CodexWindowLabels, listCodexWindows, RateLimitWindowInfo, resolveCodexPlanName, resolveCodexWindowLabel, shouldShowCodexResult, UsageProvider } from "./codex-usage"
 import {
   CachedCursorUsageProvider,
   CursorSandUsage,
@@ -56,8 +56,18 @@ interface LocaleStrings {
   claudeNotSignedIn: string
   claudeNotFound: string
   claudeExtraUsage: string
+  namedUsageTitle: string
+  planResetIn: string
+  groupCodex: string
+  groupClaude: string
+  groupCursor: string
+  groupGrok: string
   windowClaudeSession: string
   windowClaudeWeek: string
+  windowClaudeExtra: string
+  windowCursorModelsTitle: string
+  windowOtherModelsTitle: string
+  windowRequestsTitle: string
   windowGrokBuild: string
   windowGrokChat: string
   windowGrokBot: string
@@ -97,8 +107,18 @@ const DEFAULT_LOCALE_STRINGS: LocaleStrings = {
   claudeNotSignedIn: "Sign in to Claude Code on this machine",
   claudeNotFound: "Claude Code is not installed on this machine",
   claudeExtraUsage: "Extra %s / %s",
+  namedUsageTitle: "%s %s Usage",
+  planResetIn: "%s · reset in %s",
+  groupCodex: "Codex",
+  groupClaude: "Claude",
+  groupCursor: "Cursor",
+  groupGrok: "Grok",
   windowClaudeSession: "Session",
   windowClaudeWeek: "Week",
+  windowClaudeExtra: "Extra",
+  windowCursorModelsTitle: "Models",
+  windowOtherModelsTitle: "Other Models",
+  windowRequestsTitle: "Requests",
   windowGrokBuild: "Build",
   windowGrokChat: "Chat",
   windowGrokBot: "Bot",
@@ -148,7 +168,9 @@ export class AIQuotaPlugin implements Plugin {
     if (includesProvider(filter, "codex")) {
       try {
         const snapshot = forceRefresh ? await this.provider.refresh(ctx, this.api) : await this.provider.getSnapshot(ctx, this.api)
-        results.push(...(await buildResults(snapshot, this.api, ctx, this.provider)))
+        if (shouldShowCodexResult(snapshot, filter)) {
+          results.push(...(await buildResults(snapshot, this.api, ctx, this.provider)))
+        }
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error)
         await safeLog(this.api, ctx, "Error", "Failed to read Codex usage: " + message)
@@ -269,87 +291,363 @@ export async function buildResults(snapshot: CodexUsageSnapshot, api: PublicAPI,
   const summaryText = buildSummaryText(snapshot, strings, subtitle)
   const rawText = JSON.stringify(snapshot, null, 2)
   const commonActions = buildCommonActions(summaryText, rawText, api, ctx, provider)
+  const group = usageGroup(strings.groupCodex, 100)
+  const windows = listCodexWindows(snapshot.rateLimits)
+  const labels = toCodexWindowLabels(strings)
 
-  return [
-    {
-      Id: "codex-usage-overview",
-      Title: "i18n:result_title",
-      SubTitle: subtitle,
-      Icon: CODEX_ICON,
-      Score: 100,
-      Tails: buildOverviewTails(snapshot, strings),
-      Actions: commonActions
-    }
-  ]
+  if (windows.length === 0) {
+    return [
+      groupedResult(
+        {
+          Id: "codex-usage-overview",
+          Title: "i18n:result_title",
+          SubTitle: subtitle,
+          Icon: CODEX_ICON,
+          Tails: [],
+          Actions: commonActions
+        },
+        group,
+        100
+      )
+    ]
+  }
+
+  const results: Result[] = []
+  const planName = resolveCodexPlanName(snapshot)
+  for (let index = 0; index < windows.length; index += 1) {
+    const label = resolveCodexWindowLabel(windows[index], labels)
+    const resetLabel = formatRelativeReset(windows[index], strings)
+    const subtitle = planName !== null ? formatTemplate(strings.planResetIn, planName, resetLabel) : formatTemplate(strings.subtitleResetIn, label, resetLabel)
+    results.push(
+      groupedResult(
+        {
+          Id: "codex-usage-" + slugify(label) + "-" + String(index),
+          Title: formatTemplate(strings.namedUsageTitle, strings.groupCodex, label),
+          SubTitle: subtitle,
+          Icon: CODEX_ICON,
+          Tails: [buildProgressTail(label, windows[index])],
+          Actions: commonActions
+        },
+        group,
+        100 - index
+      )
+    )
+  }
+
+  return results
 }
 
 export async function buildClaudeResults(snapshot: ClaudeUsageSnapshot, api: PublicAPI, ctx: Context, provider: ClaudeUsageProvider): Promise<Result[]> {
   const strings = await readLocaleStrings(api, ctx)
+  const group = usageGroup(strings.groupClaude, 95)
+  const actions = buildClaudeActions(api, ctx, provider)
 
-  return [
-    {
-      Id: "claude-usage-overview",
-      Title: "i18n:claude_result_title",
-      SubTitle: buildClaudeSubtitle(snapshot, strings),
-      Icon: CLAUDE_ICON,
-      Score: 95,
-      Tails: buildClaudeTails(snapshot, strings),
-      Actions: buildClaudeActions(api, ctx, provider)
-    }
-  ]
+  if (snapshot.availability !== "ready") {
+    return [
+      groupedResult(
+        {
+          Id: "claude-usage-overview",
+          Title: "i18n:claude_result_title",
+          SubTitle: buildClaudeSubtitle(snapshot, strings),
+          Icon: CLAUDE_ICON,
+          Tails: [],
+          Actions: actions
+        },
+        group,
+        95
+      )
+    ]
+  }
+
+  const results: Result[] = []
+  const windows = listClaudeDisplayWindows(snapshot.windows)
+  const planName = snapshot.planName !== null ? snapshot.planName : strings.groupClaude
+
+  for (let index = 0; index < windows.length; index += 1) {
+    const window = windows[index]
+    const label = claudeWindowLabel(window, strings)
+    results.push(
+      groupedResult(
+        {
+          Id: "claude-usage-" + slugify(label) + "-" + String(index),
+          Title: formatTemplate(strings.namedUsageTitle, strings.groupClaude, label),
+          SubTitle: formatTemplate(strings.planResetIn, planName, formatRelativeResetAt(window.resetsAt, strings)),
+          Icon: CLAUDE_ICON,
+          Tails: [buildRemainingProgressTail(claudeBarLabel(window, strings), getClaudeRemainingPercent(window.usedPercent))],
+          Actions: actions
+        },
+        group,
+        95 - index
+      )
+    )
+  }
+
+  const extra = formatClaudeExtraUsage(snapshot.extraUsage, strings)
+  if (extra !== null) {
+    results.push(
+      groupedResult(
+        {
+          Id: "claude-usage-extra",
+          Title: formatTemplate(strings.namedUsageTitle, strings.groupClaude, strings.windowClaudeExtra),
+          SubTitle: planName + " · " + extra,
+          Icon: CLAUDE_ICON,
+          Tails: [buildRemainingProgressTail(strings.windowClaudeExtra, getClaudeExtraRemainingPercent(snapshot.extraUsage))],
+          Actions: actions
+        },
+        group,
+        95 - results.length
+      )
+    )
+  }
+
+  if (results.length === 0) {
+    return [
+      groupedResult(
+        {
+          Id: "claude-usage-overview",
+          Title: "i18n:claude_result_title",
+          SubTitle: strings.claudeNoLiveData,
+          Icon: CLAUDE_ICON,
+          Tails: [],
+          Actions: actions
+        },
+        group,
+        95
+      )
+    ]
+  }
+
+  return results
 }
 
 export async function buildGrokResults(snapshot: GrokUsageSnapshot, api: PublicAPI, ctx: Context, provider: GrokUsageProvider): Promise<Result[]> {
   const strings = await readLocaleStrings(api, ctx)
+  const group = usageGroup(strings.groupGrok, 80)
+  const actions = buildGrokActions(api, ctx, provider)
 
-  return [
-    {
-      Id: "grok-usage-overview",
-      Title: "i18n:grok_result_title",
-      SubTitle: buildGrokSubtitle(snapshot, strings),
-      Icon: GROK_ICON,
-      Score: 80,
-      Tails: buildGrokTails(snapshot, strings),
-      Actions: buildGrokActions(api, ctx, provider)
+  if (snapshot.availability !== "ready") {
+    return [
+      groupedResult(
+        {
+          Id: "grok-usage-overview",
+          Title: "i18n:grok_result_title",
+          SubTitle: buildGrokSubtitle(snapshot, strings),
+          Icon: GROK_ICON,
+          Tails: [],
+          Actions: actions
+        },
+        group,
+        80
+      )
+    ]
+  }
+
+  const results: Result[] = []
+  const planName = snapshot.planName !== null ? snapshot.planName : "SuperGrok"
+  const periodLabel = grokPeriodLabel(snapshot.periodType, strings)
+  const remaining = getGrokRemainingPercent(snapshot.creditUsagePercent)
+  if (remaining !== null) {
+    results.push(
+      groupedResult(
+        {
+          Id: "grok-usage-period",
+          Title: formatTemplate(strings.namedUsageTitle, strings.groupGrok, periodLabel),
+          SubTitle: formatTemplate(strings.grokPeriodReset, planName, periodLabel, formatRelativeResetAt(snapshot.billingCycleEnd, strings)),
+          Icon: GROK_ICON,
+          Tails: [buildRemainingProgressTail(periodLabel, remaining)],
+          Actions: actions
+        },
+        group,
+        80
+      )
+    )
+  }
+
+  for (let index = 0; index < snapshot.productUsage.length; index += 1) {
+    const product = snapshot.productUsage[index]
+    const productRemaining = getGrokRemainingPercent(product.usagePercent)
+    if (productRemaining === null || productRemaining === remaining) {
+      continue
     }
-  ]
+
+    const label = productBarLabel(product.product, strings)
+    results.push(
+      groupedResult(
+        {
+          Id: "grok-usage-" + slugify(label) + "-" + String(index),
+          Title: formatTemplate(strings.namedUsageTitle, strings.groupGrok, label),
+          SubTitle: formatTemplate(strings.planResetIn, planName, formatRelativeResetAt(snapshot.billingCycleEnd, strings)),
+          Icon: GROK_ICON,
+          Tails: [buildRemainingProgressTail(label, productRemaining)],
+          Actions: actions
+        },
+        group,
+        80 - results.length
+      )
+    )
+  }
+
+  if (results.length === 0) {
+    return [
+      groupedResult(
+        {
+          Id: "grok-usage-overview",
+          Title: "i18n:grok_result_title",
+          SubTitle: buildGrokSubtitle(snapshot, strings),
+          Icon: GROK_ICON,
+          Tails: [],
+          Actions: actions
+        },
+        group,
+        80
+      )
+    ]
+  }
+
+  return results
 }
 
 export async function buildGrokBotResults(snapshot: CursorUsageSnapshot, api: PublicAPI, ctx: Context, provider: CursorUsageProvider): Promise<Result[]> {
   const strings = await readLocaleStrings(api, ctx)
 
   return [
-    {
-      Id: "grok-bot-usage-overview",
-      Title: "i18n:grok_bot_result_title",
-      SubTitle: buildGrokBotSubtitle(snapshot.sandUsage, strings),
-      Icon: GROK_BOT_ICON,
-      Score: 85,
-      Tails: buildGrokBotTails(snapshot.sandUsage, strings),
-      Actions: buildCursorActions(api, ctx, provider)
-    }
+    groupedResult(
+      {
+        Id: "grok-bot-usage-overview",
+        Title: "i18n:grok_bot_result_title",
+        SubTitle: buildGrokBotSubtitle(snapshot.sandUsage, snapshot.planName, strings),
+        Icon: GROK_BOT_ICON,
+        Tails: buildGrokBotTails(snapshot.sandUsage, strings),
+        Actions: buildCursorActions(api, ctx, provider)
+      },
+      usageGroup(strings.groupGrok, 80),
+      70
+    )
   ]
 }
 
 export async function buildCursorResults(snapshot: CursorUsageSnapshot, api: PublicAPI, ctx: Context, provider: CursorUsageProvider): Promise<Result[]> {
   const strings = await readLocaleStrings(api, ctx)
+  const group = usageGroup(strings.groupCursor, 90)
+  const actions = buildCursorActions(api, ctx, provider)
   const subtitle = buildCursorSubtitle(snapshot, strings)
 
-  return [
-    {
-      Id: "cursor-usage-overview",
-      Title: "i18n:cursor_result_title",
-      SubTitle: subtitle,
-      Icon: CURSOR_ICON,
-      Score: 90,
-      Tails: buildCursorTails(snapshot, strings),
-      Actions: buildCursorActions(api, ctx, provider)
-    }
-  ]
+  if (snapshot.availability !== "ready") {
+    return [
+      groupedResult(
+        {
+          Id: "cursor-usage-overview",
+          Title: "i18n:cursor_result_title",
+          SubTitle: subtitle,
+          Icon: CURSOR_ICON,
+          Tails: [],
+          Actions: actions
+        },
+        group,
+        90
+      )
+    ]
+  }
+
+  const results: Result[] = []
+  if (snapshot.requestUsage !== null) {
+    results.push(
+      groupedResult(
+        {
+          Id: "cursor-usage-requests",
+          Title: formatTemplate(strings.namedUsageTitle, strings.groupCursor, strings.windowRequestsTitle),
+          SubTitle: subtitle,
+          Icon: CURSOR_ICON,
+          Tails: [buildRemainingProgressTail(strings.windowRequests, getRequestRemainingPercent(snapshot.requestUsage))],
+          Actions: actions
+        },
+        group,
+        90
+      )
+    )
+    return results
+  }
+
+  const cursorRemaining = getCursorModelRemainingPercent(snapshot.planUsage)
+  const otherRemaining = getOtherModelRemainingPercent(snapshot.planUsage)
+  if (cursorRemaining !== null) {
+    results.push(
+      groupedResult(
+        {
+          Id: "cursor-usage-models",
+          Title: formatTemplate(strings.namedUsageTitle, strings.groupCursor, strings.windowCursorModelsTitle),
+          SubTitle: subtitle,
+          Icon: CURSOR_ICON,
+          Tails: [buildRemainingProgressTail(strings.windowCursorModels, cursorRemaining)],
+          Actions: actions
+        },
+        group,
+        90
+      )
+    )
+  }
+
+  if (otherRemaining !== null) {
+    results.push(
+      groupedResult(
+        {
+          Id: "cursor-usage-other",
+          Title: formatTemplate(strings.namedUsageTitle, strings.groupCursor, strings.windowOtherModelsTitle),
+          SubTitle: subtitle,
+          Icon: CURSOR_ICON,
+          Tails: [buildRemainingProgressTail(strings.windowOtherModels, otherRemaining)],
+          Actions: actions
+        },
+        group,
+        89
+      )
+    )
+  }
+
+  if (results.length === 0 && snapshot.planUsage !== null && snapshot.planUsage.totalPercentUsed !== null) {
+    results.push(
+      groupedResult(
+        {
+          Id: "cursor-usage-overview",
+          Title: "i18n:cursor_result_title",
+          SubTitle: subtitle,
+          Icon: CURSOR_ICON,
+          Tails: [buildRemainingProgressTail(strings.windowLimit, clamp(Math.round(100 - snapshot.planUsage.totalPercentUsed), 0, 100))],
+          Actions: actions
+        },
+        group,
+        90
+      )
+    )
+  }
+
+  if (results.length === 0) {
+    return [
+      groupedResult(
+        {
+          Id: "cursor-usage-overview",
+          Title: "i18n:cursor_result_title",
+          SubTitle: subtitle,
+          Icon: CURSOR_ICON,
+          Tails: [],
+          Actions: actions
+        },
+        group,
+        90
+      )
+    ]
+  }
+
+  return results
 }
 
 function buildOverviewSubtitle(snapshot: CodexUsageSnapshot, strings: LocaleStrings): string {
   const parts: string[] = []
+  const planName = resolveCodexPlanName(snapshot)
+  if (planName !== null) {
+    parts.push(planName)
+  }
+
   const windows = listCodexWindows(snapshot.rateLimits)
   const labels = toCodexWindowLabels(strings)
 
@@ -365,7 +663,7 @@ function buildOverviewSubtitle(snapshot: CodexUsageSnapshot, strings: LocaleStri
     parts.push(strings.subtitleFallback)
   }
 
-  return parts.join(" | ")
+  return parts.join(" · ")
 }
 
 function buildClaudeSubtitle(snapshot: ClaudeUsageSnapshot, strings: LocaleStrings): string {
@@ -385,28 +683,7 @@ function buildClaudeSubtitle(snapshot: ClaudeUsageSnapshot, strings: LocaleStrin
     return snapshot.warnings.length > 0 ? snapshot.warnings[0] : strings.claudeNoLiveData
   }
 
-  const planName = snapshot.planName !== null ? snapshot.planName : "Claude"
-  const parts: string[] = []
-  const windows = listClaudeDisplayWindows(snapshot.windows)
-
-  for (let index = 0; index < windows.length; index += 1) {
-    parts.push(formatTemplate(strings.subtitleResetIn, claudeWindowLabel(windows[index], strings), formatRelativeResetAt(windows[index].resetsAt, strings)))
-  }
-
-  const extra = formatClaudeExtraUsage(snapshot.extraUsage, strings)
-  if (extra !== null) {
-    parts.push(extra)
-  }
-
-  if (parts.length === 0) {
-    parts.push(strings.claudeNoLiveData)
-  }
-
-  if (snapshot.warnings.length > 0) {
-    parts.push(strings.subtitleFallback)
-  }
-
-  return planName + " · " + parts.join(" | ")
+  return strings.claudeNoLiveData
 }
 
 function formatClaudeExtraUsage(extraUsage: ClaudeExtraUsage | null, strings: LocaleStrings): string | null {
@@ -433,24 +710,6 @@ function claudeWindowLabel(window: ClaudeUsageWindow, strings: LocaleStrings): s
   }
 
   return window.label
-}
-
-function buildClaudeTails(snapshot: ClaudeUsageSnapshot, strings: LocaleStrings): ResultTail[] {
-  const tails: ResultTail[] = []
-  const windows = listClaudeDisplayWindows(snapshot.windows)
-
-  for (let index = 0; index < windows.length && tails.length < 3; index += 1) {
-    tails.push(buildRemainingProgressTail(claudeBarLabel(windows[index], strings), getClaudeRemainingPercent(windows[index].usedPercent)))
-  }
-
-  if (tails.length === 0) {
-    const remaining = getClaudeExtraRemainingPercent(snapshot.extraUsage)
-    if (remaining !== null) {
-      tails.push(buildRemainingProgressTail(strings.windowLimit, remaining))
-    }
-  }
-
-  return tails
 }
 
 function claudeBarLabel(window: ClaudeUsageWindow, strings: LocaleStrings): string {
@@ -494,9 +753,10 @@ function buildGrokSubtitle(snapshot: GrokUsageSnapshot, strings: LocaleStrings):
   return parts.join(" | ")
 }
 
-function buildGrokBotSubtitle(sandUsage: CursorSandUsage | null, strings: LocaleStrings): string {
+function buildGrokBotSubtitle(sandUsage: CursorSandUsage | null, planName: string | null, strings: LocaleStrings): string {
   const resetLabel = formatRelativeResetAt(sandUsage !== null ? sandUsage.resetAt : null, strings)
-  return formatTemplate(strings.grokBotWeekReset, "Grok Bot", resetLabel)
+  const name = planName !== null && planName.length > 0 ? planName : "Grok Bot"
+  return formatTemplate(strings.grokBotWeekReset, name, resetLabel)
 }
 
 function buildGrokBotTails(sandUsage: CursorSandUsage | null, strings: LocaleStrings): ResultTail[] {
@@ -518,30 +778,6 @@ function grokPeriodLabel(periodType: GrokPeriodType, strings: LocaleStrings): st
   }
 
   return strings.windowLimit
-}
-
-function buildGrokTails(snapshot: GrokUsageSnapshot, strings: LocaleStrings): ResultTail[] {
-  const tails: ResultTail[] = []
-  const remaining = getGrokRemainingPercent(snapshot.creditUsagePercent)
-  if (remaining !== null) {
-    tails.push(buildRemainingProgressTail(grokPeriodBarLabel(snapshot.periodType, strings), remaining))
-  }
-
-  for (let index = 0; index < snapshot.productUsage.length && tails.length < 2; index += 1) {
-    const product = snapshot.productUsage[index]
-    const productRemaining = getGrokRemainingPercent(product.usagePercent)
-    if (productRemaining === null || productRemaining === remaining) {
-      continue
-    }
-
-    tails.push(buildRemainingProgressTail(productBarLabel(product.product, strings), productRemaining))
-  }
-
-  return tails
-}
-
-function grokPeriodBarLabel(periodType: GrokPeriodType, strings: LocaleStrings): string {
-  return grokPeriodLabel(periodType, strings)
 }
 
 function productBarLabel(product: string, strings: LocaleStrings): string {
@@ -594,40 +830,30 @@ function buildCursorSubtitle(snapshot: CursorUsageSnapshot, strings: LocaleStrin
   return parts.join(" | ")
 }
 
-function buildCursorTails(snapshot: CursorUsageSnapshot, strings: LocaleStrings): ResultTail[] {
-  if (snapshot.requestUsage !== null) {
-    return [buildRemainingProgressTail(strings.windowRequests, getRequestRemainingPercent(snapshot.requestUsage))]
+function usageGroup(name: string, score: number): { name: string; score: number } {
+  return {
+    name: name,
+    score: score
   }
-
-  const tails: ResultTail[] = []
-  const cursorRemaining = getCursorModelRemainingPercent(snapshot.planUsage)
-  const otherRemaining = getOtherModelRemainingPercent(snapshot.planUsage)
-
-  if (cursorRemaining !== null) {
-    tails.push(buildRemainingProgressTail(strings.windowCursorModels, cursorRemaining))
-  }
-
-  if (otherRemaining !== null) {
-    tails.push(buildRemainingProgressTail(strings.windowOtherModels, otherRemaining))
-  }
-
-  if (tails.length === 0 && snapshot.planUsage !== null && snapshot.planUsage.totalPercentUsed !== null) {
-    tails.push(buildRemainingProgressTail(strings.windowLimit, clamp(Math.round(100 - snapshot.planUsage.totalPercentUsed), 0, 100)))
-  }
-
-  return tails
 }
 
-function buildOverviewTails(snapshot: CodexUsageSnapshot, strings: LocaleStrings): ResultTail[] {
-  const windows = listCodexWindows(snapshot.rateLimits)
-  const labels = toCodexWindowLabels(strings)
-  const tails: ResultTail[] = []
-
-  for (let index = 0; index < windows.length; index += 1) {
-    tails.push(buildProgressTail(resolveCodexWindowLabel(windows[index], labels), windows[index]))
+function groupedResult(result: Result, group: { name: string; score: number }, score: number): Result {
+  return {
+    ...result,
+    Score: score,
+    Group: group.name,
+    GroupScore: group.score
   }
+}
 
-  return tails
+function slugify(value: string): string {
+  const slug = value
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+/, "")
+    .replace(/-+$/, "")
+  return slug.length > 0 ? slug : "window"
 }
 
 function buildProgressTail(label: string, window: RateLimitWindowInfo | null): ResultTail {
@@ -791,6 +1017,8 @@ function buildCursorErrorResult(message: string, api: PublicAPI, ctx: Context, p
     Title: "i18n:cursor_error_title",
     SubTitle: message,
     Icon: CURSOR_ICON,
+    Group: DEFAULT_LOCALE_STRINGS.groupCursor,
+    GroupScore: 90,
     Score: 90,
     Actions: [
       {
@@ -832,6 +1060,8 @@ function buildClaudeErrorResult(message: string, api: PublicAPI, ctx: Context, p
     Title: "i18n:claude_error_title",
     SubTitle: message,
     Icon: CLAUDE_ICON,
+    Group: DEFAULT_LOCALE_STRINGS.groupClaude,
+    GroupScore: 95,
     Score: 95,
     Actions: [
       {
@@ -873,6 +1103,8 @@ function buildGrokErrorResult(message: string, api: PublicAPI, ctx: Context, pro
     Title: "i18n:grok_error_title",
     SubTitle: message,
     Icon: GROK_ICON,
+    Group: DEFAULT_LOCALE_STRINGS.groupGrok,
+    GroupScore: 80,
     Score: 80,
     Actions: [
       {
@@ -914,6 +1146,8 @@ function buildErrorResult(message: string, api: PublicAPI, ctx: Context, provide
     Title: "i18n:error_title",
     SubTitle: message,
     Icon: CODEX_ICON,
+    Group: DEFAULT_LOCALE_STRINGS.groupCodex,
+    GroupScore: 100,
     Score: 100,
     Actions: [
       {
@@ -1068,8 +1302,18 @@ async function readLocaleStrings(api: PublicAPI, ctx: Context): Promise<LocaleSt
     claudeNotSignedIn: await translate(api, ctx, "claude_not_signed_in", DEFAULT_LOCALE_STRINGS.claudeNotSignedIn),
     claudeNotFound: await translate(api, ctx, "claude_not_found", DEFAULT_LOCALE_STRINGS.claudeNotFound),
     claudeExtraUsage: await translate(api, ctx, "claude_extra_usage", DEFAULT_LOCALE_STRINGS.claudeExtraUsage),
+    namedUsageTitle: await translate(api, ctx, "named_usage_title", DEFAULT_LOCALE_STRINGS.namedUsageTitle),
+    planResetIn: await translate(api, ctx, "plan_reset_in", DEFAULT_LOCALE_STRINGS.planResetIn),
+    groupCodex: await translate(api, ctx, "group_codex", DEFAULT_LOCALE_STRINGS.groupCodex),
+    groupClaude: await translate(api, ctx, "group_claude", DEFAULT_LOCALE_STRINGS.groupClaude),
+    groupCursor: await translate(api, ctx, "group_cursor", DEFAULT_LOCALE_STRINGS.groupCursor),
+    groupGrok: await translate(api, ctx, "group_grok", DEFAULT_LOCALE_STRINGS.groupGrok),
     windowClaudeSession: await translate(api, ctx, "window_claude_session", DEFAULT_LOCALE_STRINGS.windowClaudeSession),
     windowClaudeWeek: await translate(api, ctx, "window_claude_week", DEFAULT_LOCALE_STRINGS.windowClaudeWeek),
+    windowClaudeExtra: await translate(api, ctx, "window_claude_extra", DEFAULT_LOCALE_STRINGS.windowClaudeExtra),
+    windowCursorModelsTitle: await translate(api, ctx, "window_cursor_models_title", DEFAULT_LOCALE_STRINGS.windowCursorModelsTitle),
+    windowOtherModelsTitle: await translate(api, ctx, "window_other_models_title", DEFAULT_LOCALE_STRINGS.windowOtherModelsTitle),
+    windowRequestsTitle: await translate(api, ctx, "window_requests_title", DEFAULT_LOCALE_STRINGS.windowRequestsTitle),
     windowGrokBuild: await translate(api, ctx, "window_grok_build", DEFAULT_LOCALE_STRINGS.windowGrokBuild),
     windowGrokChat: await translate(api, ctx, "window_grok_chat", DEFAULT_LOCALE_STRINGS.windowGrokChat),
     windowGrokBot: await translate(api, ctx, "window_grok_bot", DEFAULT_LOCALE_STRINGS.windowGrokBot),
