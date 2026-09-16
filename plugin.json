@@ -23,7 +23,7 @@
   "Description": "i18n:plugin_desc",
   "Author": "Wox-launcher",
   "Version": "0.6.0",
-  "MinWoxVersion": "2.0.0",
+  "MinWoxVersion": "2.4.4",
   "Runtime": "nodejs",
   "Website": "https://github.com/Wox-launcher/Wox.Plugin.AIQuota",
   "Entry": "index.js",
