@@ -408,6 +408,10 @@ export function getClaudeRemainingPercent(usedPercent: number | null): number | 
   return clamp(Math.round(100 - usedPercent), 0, 100)
 }
 
+export function shouldShowClaudeReset(window: Pick<ClaudeUsageWindow, "usedPercent" | "resetsAt">): boolean {
+  return window.usedPercent > 0 && window.resetsAt !== null
+}
+
 export function getClaudeExtraRemainingPercent(extraUsage: ClaudeExtraUsage | null): number | null {
   if (extraUsage === null) {
     return null

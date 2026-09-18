@@ -9,6 +9,7 @@ import {
   isJwtExpired,
   readLegacyRequestUsage,
   getGrokBotRemainingPercent,
+  shouldShowGrokBotReset,
   readPeriodUsage,
   readPlanInfo,
   readPlanUsage,
@@ -162,6 +163,9 @@ describe("readSandUsage", () => {
     expect(shouldShowGrokBotResult(snapshot, "grok")).toBe(true)
     expect(shouldShowGrokBotResult(snapshot, "cursor")).toBe(false)
     expect(shouldShowGrokBotResult({ ...snapshot, sandUsage: null }, "all")).toBe(false)
+    expect(shouldShowGrokBotReset({ usagePercent: 0, periodStart: 1, resetAt: 2 })).toBe(false)
+    expect(shouldShowGrokBotReset({ usagePercent: 12, periodStart: 1, resetAt: null })).toBe(false)
+    expect(shouldShowGrokBotReset({ usagePercent: 12, periodStart: 1, resetAt: 2 })).toBe(true)
   })
 })
 

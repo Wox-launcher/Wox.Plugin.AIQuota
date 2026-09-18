@@ -13,6 +13,8 @@ const DEFAULT_REQUEST_TIMEOUT_MS = 8000
 const TOKEN_EXPIRY_SKEW_MS = 120000
 const BILLING_URL = "https://cli-chat-proxy.grok.com/v1/billing?format=credits"
 const SETTINGS_URL = "https://cli-chat-proxy.grok.com/v1/settings"
+const CREDITS_GRPC_URL = "https://grok.com/grok_api_v2.GrokBuildBilling/GetGrokCreditsConfig"
+const GRPC_WEB_EMPTY_REQUEST = Buffer.from([0, 0, 0, 0, 0])
 const OIDC_ISSUER = "https://auth.x.ai"
 const OIDC_CLIENT_ID = "b1a00492-073a-47ea-816f-4c329264a828"
 const platformRuntime = getPlatformRuntime()
@@ -270,6 +272,10 @@ function createUnavailableGrokSnapshot(warnings: string[]): GrokUsageSnapshot {
   }
 }
 
+export function shouldShowGrokReset(snapshot: Pick<GrokUsageSnapshot, "creditUsagePercent" | "billingCycleEnd">): boolean {
+  return snapshot.creditUsagePercent !== null && snapshot.creditUsagePercent > 0 && snapshot.billingCycleEnd !== null
+}
+
 export function shouldShowGrokResult(snapshot: GrokUsageSnapshot, filter: "all" | "codex" | "cursor" | "grok" | "claude"): boolean {
   if (snapshot.availability === "pending") {
     return false
@@ -389,17 +395,39 @@ export function readGrokBilling(value: unknown): {
   const currentPeriod = isRecord(config.currentPeriod) ? config.currentPeriod : null
   const periodEnd = currentPeriod !== null ? readEpochSeconds(currentPeriod.end) : readEpochSeconds(config.billingPeriodEnd)
   const periodStart = currentPeriod !== null ? readEpochSeconds(currentPeriod.start) : readEpochSeconds(config.billingPeriodStart)
+  const productUsage = readProductUsage(config.productUsage)
+  const onDemandUsed = readCents(config.onDemandUsed)
+  const onDemandCap = readCents(config.onDemandCap)
 
   return {
     periodType: readPeriodType(currentPeriod !== null ? currentPeriod.type : null, periodStart, periodEnd),
-    creditUsagePercent: readNumber(config.creditUsagePercent),
+    creditUsagePercent: readCreditUsagePercent(config, productUsage, onDemandUsed, onDemandCap),
     billingCycleStart: periodStart,
     billingCycleEnd: periodEnd,
     prepaidBalanceCents: readCents(config.prepaidBalance),
-    onDemandUsedCents: readCents(config.onDemandUsed),
-    onDemandCapCents: readCents(config.onDemandCap),
-    productUsage: readProductUsage(config.productUsage)
+    onDemandUsedCents: onDemandUsed,
+    onDemandCapCents: onDemandCap,
+    productUsage: productUsage
   }
+}
+
+export function resolveGrokCreditUsagePercent(
+  billing: Pick<ReturnType<typeof readGrokBilling>, "creditUsagePercent" | "billingCycleEnd">,
+  grpcUsedPercent: number | null
+): number | null {
+  if (billing.creditUsagePercent !== null) {
+    return billing.creditUsagePercent
+  }
+
+  if (grpcUsedPercent !== null) {
+    return grpcUsedPercent
+  }
+
+  if (billing.billingCycleEnd !== null) {
+    return 0
+  }
+
+  return null
 }
 
 export function readGrokSettings(value: unknown): string | null {
@@ -497,15 +525,17 @@ async function fetchGrokRemote(
   const results = await Promise.all([getJson(BILLING_URL, token, timeoutMs), getJson(SETTINGS_URL, token, timeoutMs).catch(() => null)])
   const billing = readGrokBilling(readApiJson(results[0], "billing"))
   const planName = results[1] !== null ? readGrokSettings(readOptionalApiJson(results[1])) : null
+  const grpcUsedPercent = billing.creditUsagePercent === null ? await fetchGrokCreditsPercent(token, timeoutMs) : null
+  const creditUsagePercent = resolveGrokCreditUsagePercent(billing, grpcUsedPercent)
 
-  if (billing.creditUsagePercent === null && billing.billingCycleEnd === null && billing.productUsage.length === 0) {
+  if (creditUsagePercent === null && billing.billingCycleEnd === null && billing.productUsage.length === 0) {
     throw new Error("Grok billing API returned no usage data")
   }
 
   return {
     planName: planName,
     periodType: billing.periodType,
-    creditUsagePercent: billing.creditUsagePercent,
+    creditUsagePercent: creditUsagePercent,
     billingCycleStart: billing.billingCycleStart,
     billingCycleEnd: billing.billingCycleEnd,
     prepaidBalanceCents: billing.prepaidBalanceCents,
@@ -697,6 +727,293 @@ function readProductUsage(value: unknown): GrokProductUsage[] {
   }
 
   return result
+}
+
+function readCreditUsagePercent(config: Record<string, unknown>, productUsage: GrokProductUsage[], onDemandUsed: number | null, onDemandCap: number | null): number | null {
+  const direct = firstNumber(config, ["creditUsagePercent", "credit_usage_percent", "usagePercent", "usedPercent"])
+  if (direct !== null) {
+    return direct
+  }
+
+  for (let index = 0; index < productUsage.length; index += 1) {
+    if (productUsage[index].usagePercent !== null) {
+      return productUsage[index].usagePercent
+    }
+  }
+
+  if (onDemandCap !== null && onDemandCap > 0 && onDemandUsed !== null) {
+    return clamp((onDemandUsed / onDemandCap) * 100, 0, 100)
+  }
+
+  return null
+}
+
+function firstNumber(value: Record<string, unknown>, keys: string[]): number | null {
+  for (let index = 0; index < keys.length; index += 1) {
+    const parsed = readNumber(value[keys[index]])
+    if (parsed !== null) {
+      return parsed
+    }
+  }
+
+  return null
+}
+
+async function fetchGrokCreditsPercent(token: string, timeoutMs: number): Promise<number | null> {
+  try {
+    const response = await requestBytes({
+      method: "POST",
+      url: CREDITS_GRPC_URL,
+      headers: {
+        Authorization: "Bearer " + token,
+        Accept: "application/grpc-web+proto",
+        "Content-Type": "application/grpc-web+proto",
+        "X-Grpc-Web": "1"
+      },
+      body: GRPC_WEB_EMPTY_REQUEST,
+      timeoutMs: timeoutMs
+    })
+
+    if (response.status < 200 || response.status >= 300) {
+      return null
+    }
+
+    return decodeGrokCreditsUsedPercent(response.body)
+  } catch {
+    return null
+  }
+}
+
+export function decodeGrokCreditsUsedPercent(buffer: Buffer): number | null {
+  const payload = readGrpcWebPayload(buffer)
+  if (payload === null) {
+    return null
+  }
+
+  const top = readProtoFields(payload)
+  const credits = top !== null ? readLengthDelimited(top, 1) : null
+  if (credits === null) {
+    return null
+  }
+
+  const fields = readProtoFields(credits)
+  if (fields === null) {
+    return null
+  }
+
+  const ratio = readProtoFloat(fields, 1)
+  if (ratio === null) {
+    return 0
+  }
+
+  if (!Number.isFinite(ratio) || ratio < 0) {
+    return null
+  }
+
+  return clamp(ratio * 100, 0, 100)
+}
+
+function readGrpcWebPayload(buffer: Buffer): Buffer | null {
+  if (buffer.length < 5) {
+    return buffer.length > 0 ? buffer : null
+  }
+
+  const flag = buffer[0]
+  if (flag !== 0 && flag !== 1 && flag !== 0x80 && flag !== 0x81) {
+    return buffer
+  }
+
+  let offset = 0
+  while (offset + 5 <= buffer.length) {
+    const frameFlag = buffer[offset]
+    const length = buffer.readUInt32BE(offset + 1)
+    const start = offset + 5
+    const end = start + length
+    if (end > buffer.length) {
+      return null
+    }
+
+    if ((frameFlag & 0x80) === 0) {
+      return buffer.subarray(start, end)
+    }
+
+    offset = end
+  }
+
+  return null
+}
+
+function readProtoFields(buffer: Buffer): Map<number, { wireType: number; bytes: Buffer; value: number }> | null {
+  const fields = new Map<number, { wireType: number; bytes: Buffer; value: number }>()
+  let offset = 0
+
+  while (offset < buffer.length) {
+    const tag = readProtoVarint(buffer, offset)
+    if (tag === null) {
+      return null
+    }
+
+    const fieldNumber = tag.value >>> 3
+    const wireType = tag.value & 7
+    if (fieldNumber === 0) {
+      return null
+    }
+
+    if (wireType === 0) {
+      const value = readProtoVarint(buffer, tag.next)
+      if (value === null) {
+        return null
+      }
+
+      fields.set(fieldNumber, { wireType: 0, bytes: Buffer.alloc(0), value: value.value })
+      offset = value.next
+      continue
+    }
+
+    if (wireType === 2) {
+      const length = readProtoVarint(buffer, tag.next)
+      if (length === null || length.value < 0) {
+        return null
+      }
+
+      const start = length.next
+      const end = start + length.value
+      if (end > buffer.length) {
+        return null
+      }
+
+      fields.set(fieldNumber, { wireType: 2, bytes: buffer.subarray(start, end), value: 0 })
+      offset = end
+      continue
+    }
+
+    if (wireType === 5) {
+      if (tag.next + 4 > buffer.length) {
+        return null
+      }
+
+      fields.set(fieldNumber, { wireType: 5, bytes: buffer.subarray(tag.next, tag.next + 4), value: 0 })
+      offset = tag.next + 4
+      continue
+    }
+
+    if (wireType === 1) {
+      if (tag.next + 8 > buffer.length) {
+        return null
+      }
+
+      fields.set(fieldNumber, { wireType: 1, bytes: buffer.subarray(tag.next, tag.next + 8), value: 0 })
+      offset = tag.next + 8
+      continue
+    }
+
+    return null
+  }
+
+  return fields
+}
+
+function readLengthDelimited(fields: Map<number, { wireType: number; bytes: Buffer; value: number }>, fieldNumber: number): Buffer | null {
+  const field = fields.get(fieldNumber)
+  if (field === undefined || field.wireType !== 2) {
+    return null
+  }
+
+  return field.bytes
+}
+
+function readProtoFloat(fields: Map<number, { wireType: number; bytes: Buffer; value: number }>, fieldNumber: number): number | null {
+  const field = fields.get(fieldNumber)
+  if (field === undefined) {
+    return null
+  }
+
+  if (field.wireType === 5 && field.bytes.length >= 4) {
+    return field.bytes.readFloatLE(0)
+  }
+
+  if (field.wireType === 1 && field.bytes.length >= 8) {
+    return field.bytes.readDoubleLE(0)
+  }
+
+  return null
+}
+
+function readProtoVarint(buffer: Buffer, offset: number): { value: number; next: number } | null {
+  let result = 0
+  let shift = 0
+  let pos = offset
+
+  for (;;) {
+    if (pos >= buffer.length) {
+      return null
+    }
+
+    const byte = buffer[pos]
+    result += (byte & 0x7f) * Math.pow(2, shift)
+    pos += 1
+    if ((byte & 0x80) === 0) {
+      break
+    }
+
+    shift += 7
+    if (shift > 35) {
+      return null
+    }
+  }
+
+  return {
+    value: result,
+    next: pos
+  }
+}
+
+async function requestBytes(options: { method: "POST"; url: string; headers: Record<string, string>; body: Buffer; timeoutMs: number }): Promise<{ status: number; body: Buffer }> {
+  return new Promise((resolve, reject) => {
+    const url = new URL(options.url)
+    const headers: Record<string, string | number> = {
+      "User-Agent": "wox-plugin-ai-quota/0.4.0",
+      "Content-Length": options.body.length
+    }
+    const headerKeys = Object.keys(options.headers)
+    for (let index = 0; index < headerKeys.length; index += 1) {
+      headers[headerKeys[index]] = options.headers[headerKeys[index]]
+    }
+
+    const req = httpsRequest(
+      {
+        protocol: url.protocol,
+        hostname: url.hostname,
+        port: url.port,
+        path: url.pathname + url.search,
+        method: options.method,
+        headers: headers
+      },
+      res => {
+        const chunks: Buffer[] = []
+        res.on("data", (chunk: Buffer) => {
+          chunks.push(chunk)
+        })
+        res.on("end", () => {
+          resolve({
+            status: res.statusCode || 0,
+            body: Buffer.concat(chunks)
+          })
+        })
+      }
+    )
+
+    req.on("error", error => {
+      reject(error instanceof Error ? error : new Error(String(error)))
+    })
+
+    req.setTimeout(options.timeoutMs, () => {
+      req.destroy(new Error("Timed out while waiting for Grok API"))
+    })
+
+    req.write(options.body)
+    req.end()
+  })
 }
 
 function readCents(value: unknown): number | null {

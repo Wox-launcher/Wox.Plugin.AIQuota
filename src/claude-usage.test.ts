@@ -10,6 +10,7 @@ import {
   mergeClaudeOauth,
   readClaudeOauth,
   readClaudeUsage,
+  shouldShowClaudeReset,
   shouldShowClaudeResult,
   shortModelLabel
 } from "./claude-usage"
@@ -173,6 +174,12 @@ describe("claude display helpers", () => {
     expect(shortModelLabel("Claude Opus 4.5")).toBe("Opus")
     expect(shortModelLabel("Fable")).toBe("Fable")
     expect(shortModelLabel("Sonnet")).toBe("Sonnet")
+  })
+
+  test("hides reset text when a window is unused or has no reset time", () => {
+    expect(shouldShowClaudeReset({ usedPercent: 0, resetsAt: 1 })).toBe(false)
+    expect(shouldShowClaudeReset({ usedPercent: 12, resetsAt: null })).toBe(false)
+    expect(shouldShowClaudeReset({ usedPercent: 98, resetsAt: 1 })).toBe(true)
   })
 
   test("lists session, week, and every scoped window for split results", () => {

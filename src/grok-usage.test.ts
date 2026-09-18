@@ -1,6 +1,6 @@
 import { join } from "path"
 
-import { formatGrokPlanName, getGrokRemainingPercent, isGrokAccessExpired, mergeGrokAuth, readGrokAuthFile, readGrokBilling, readGrokSettings, shouldShowGrokResult } from "./grok-usage"
+import { decodeGrokCreditsUsedPercent, formatGrokPlanName, getGrokRemainingPercent, isGrokAccessExpired, mergeGrokAuth, readGrokAuthFile, readGrokBilling, readGrokSettings, resolveGrokCreditUsagePercent, shouldShowGrokReset, shouldShowGrokResult } from "./grok-usage"
 import { includesProvider, resolveUsageFilter } from "./index"
 import { resolveGrokHome } from "./platform/shared"
 
@@ -32,6 +32,63 @@ describe("readGrokBilling", () => {
 
   test("treats 100 percent used as nothing remaining", () => {
     expect(getGrokRemainingPercent(100)).toBe(0)
+  })
+
+  test("reads a SuperGrok Heavy period-only payload without inventing a percent", () => {
+    const billing = readGrokBilling({
+      config: {
+        currentPeriod: {
+          type: "USAGE_PERIOD_TYPE_WEEKLY",
+          start: "2026-09-17T07:07:59.159559+00:00",
+          end: "2026-09-24T07:07:59.159559+00:00"
+        },
+        onDemandCap: { val: 0 },
+        onDemandUsed: { val: 0 },
+        isUnifiedBillingUser: true,
+        billingPeriodStart: "2026-09-17T07:07:59.159559+00:00",
+        billingPeriodEnd: "2026-09-24T07:07:59.159559+00:00"
+      }
+    })
+
+    expect(billing.creditUsagePercent).toBeNull()
+    expect(billing.periodType).toBe("weekly")
+    expect(resolveGrokCreditUsagePercent(billing, null)).toBe(0)
+    expect(resolveGrokCreditUsagePercent(billing, 1.25)).toBe(1.25)
+    expect(getGrokRemainingPercent(resolveGrokCreditUsagePercent(billing, null))).toBe(100)
+  })
+
+  test("falls back to product usage when the credits percent is omitted", () => {
+    const billing = readGrokBilling({
+      config: {
+        productUsage: [{ product: "GrokBuild", usagePercent: 12 }]
+      }
+    })
+
+    expect(billing.creditUsagePercent).toBe(12)
+  })
+})
+
+describe("decodeGrokCreditsUsedPercent", () => {
+  test("reads a framed usage ratio as percent used", () => {
+    const ratio = Buffer.alloc(4)
+    ratio.writeFloatLE(0.01, 0)
+    const credits = Buffer.concat([Buffer.from([0x0d]), ratio])
+    const message = Buffer.concat([Buffer.from([0x0a, credits.length]), credits])
+    const frame = Buffer.alloc(5 + message.length)
+    frame.writeUInt32BE(message.length, 1)
+    message.copy(frame, 5)
+
+    expect(decodeGrokCreditsUsedPercent(frame)).toBeCloseTo(1, 5)
+  })
+
+  test("treats an omitted usage ratio as zero used", () => {
+    const credits = Buffer.from([0x12, 0x00])
+    const message = Buffer.concat([Buffer.from([0x0a, credits.length]), credits])
+    const frame = Buffer.alloc(5 + message.length)
+    frame.writeUInt32BE(message.length, 1)
+    message.copy(frame, 5)
+
+    expect(decodeGrokCreditsUsedPercent(frame)).toBe(0)
   })
 })
 
@@ -157,6 +214,12 @@ describe("grok display helpers", () => {
     expect(shouldShowGrokResult(pending, "all")).toBe(false)
     expect(shouldShowGrokResult(pending, "grok")).toBe(false)
     expect(shouldShowGrokResult({ ...pending, availability: "ready" }, "all")).toBe(true)
+  })
+
+  test("hides reset text when the period is unused", () => {
+    expect(shouldShowGrokReset({ creditUsagePercent: 0, billingCycleEnd: 1 })).toBe(false)
+    expect(shouldShowGrokReset({ creditUsagePercent: 98, billingCycleEnd: null })).toBe(false)
+    expect(shouldShowGrokReset({ creditUsagePercent: 98, billingCycleEnd: 1 })).toBe(true)
   })
 })
 

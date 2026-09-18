@@ -714,6 +714,10 @@ export function shouldShowGrokBotResult(snapshot: CursorUsageSnapshot | null, fi
   return filter === "all" || filter === "grok"
 }
 
+export function shouldShowGrokBotReset(sandUsage: CursorSandUsage | null): boolean {
+  return sandUsage !== null && sandUsage.usagePercent > 0 && sandUsage.resetAt !== null
+}
+
 export function getGrokBotRemainingPercent(sandUsage: CursorSandUsage | null): number | null {
   if (sandUsage === null) {
     return null

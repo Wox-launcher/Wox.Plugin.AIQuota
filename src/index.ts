@@ -11,6 +11,7 @@ import {
   getGrokBotRemainingPercent,
   getRequestRemainingPercent,
   shouldShowCursorResult,
+  shouldShowGrokBotReset,
   shouldShowGrokBotResult
 } from "./cursor-usage"
 import {
@@ -23,9 +24,10 @@ import {
   getClaudeExtraRemainingPercent,
   getClaudeRemainingPercent,
   listClaudeDisplayWindows,
+  shouldShowClaudeReset,
   shouldShowClaudeResult
 } from "./claude-usage"
-import { CachedGrokUsageProvider, getGrokRemainingPercent, GrokPeriodType, GrokUsageProvider, GrokUsageSnapshot, shouldShowGrokResult } from "./grok-usage"
+import { CachedGrokUsageProvider, getGrokRemainingPercent, GrokPeriodType, GrokUsageProvider, GrokUsageSnapshot, shouldShowGrokReset, shouldShowGrokResult } from "./grok-usage"
 import { CLAUDE_ICON, CODEX_ICON, CURSOR_ICON, GROK_BOT_ICON, GROK_ICON } from "./icons"
 
 interface LocaleStrings {
@@ -371,7 +373,7 @@ export async function buildClaudeResults(snapshot: ClaudeUsageSnapshot, api: Pub
         {
           Id: "claude-usage-" + slugify(label) + "-" + String(index),
           Title: formatTemplate(strings.namedUsageTitle, strings.groupClaude, label),
-          SubTitle: formatTemplate(strings.planResetIn, planName, formatRelativeResetAt(window.resetsAt, strings)),
+          SubTitle: buildClaudeWindowSubtitle(planName, window, strings),
           Icon: CLAUDE_ICON,
           Tails: [buildRemainingProgressTail(claudeBarLabel(window, strings), getClaudeRemainingPercent(window.usedPercent))],
           Actions: actions
@@ -700,6 +702,14 @@ function formatClaudeExtraUsage(extraUsage: ClaudeExtraUsage | null, strings: Lo
   return formatTemplate(strings.claudeExtraUsage, used, limit)
 }
 
+function buildClaudeWindowSubtitle(planName: string, window: ClaudeUsageWindow, strings: LocaleStrings): string {
+  if (!shouldShowClaudeReset(window)) {
+    return planName
+  }
+
+  return formatTemplate(strings.planResetIn, planName, formatRelativeResetAt(window.resetsAt, strings))
+}
+
 function claudeWindowLabel(window: ClaudeUsageWindow, strings: LocaleStrings): string {
   if (window.kind === "session") {
     return strings.windowClaudeSession
@@ -742,9 +752,9 @@ function buildGrokSubtitle(snapshot: GrokUsageSnapshot, strings: LocaleStrings):
   }
 
   const planName = snapshot.planName !== null ? snapshot.planName : "SuperGrok"
-  const periodLabel = grokPeriodLabel(snapshot.periodType, strings)
-  const resetLabel = formatRelativeResetAt(snapshot.billingCycleEnd, strings)
-  const parts = [formatTemplate(strings.grokPeriodReset, planName, periodLabel, resetLabel)]
+  const parts = shouldShowGrokReset(snapshot)
+    ? [formatTemplate(strings.grokPeriodReset, planName, grokPeriodLabel(snapshot.periodType, strings), formatRelativeResetAt(snapshot.billingCycleEnd, strings))]
+    : [planName]
 
   if (snapshot.warnings.length > 0) {
     parts.push(strings.subtitleFallback)
@@ -754,9 +764,12 @@ function buildGrokSubtitle(snapshot: GrokUsageSnapshot, strings: LocaleStrings):
 }
 
 function buildGrokBotSubtitle(sandUsage: CursorSandUsage | null, planName: string | null, strings: LocaleStrings): string {
-  const resetLabel = formatRelativeResetAt(sandUsage !== null ? sandUsage.resetAt : null, strings)
   const name = planName !== null && planName.length > 0 ? planName : "Grok Bot"
-  return formatTemplate(strings.grokBotWeekReset, name, resetLabel)
+  if (!shouldShowGrokBotReset(sandUsage)) {
+    return name
+  }
+
+  return formatTemplate(strings.grokBotWeekReset, name, formatRelativeResetAt(sandUsage !== null ? sandUsage.resetAt : null, strings))
 }
 
 function buildGrokBotTails(sandUsage: CursorSandUsage | null, strings: LocaleStrings): ResultTail[] {
@@ -875,20 +888,213 @@ function buildRemainingProgressTail(label: string, remaining: number | null): Re
 }
 
 function renderProgressSvg(label: string, remaining: number | null): string {
-  const percentText = remaining === null ? "--" : String(remaining) + "%"
+  const percentText = remaining === null ? "--" : String(Math.round(remaining)) + "%"
   const safeRemaining = remaining === null ? 0 : clamp(remaining, 0, 100)
   const fillColor = getProgressFillColor(remaining)
-  const width = 96
-  const radius = 9
-  const fillWidth = Math.round(((width - 2) * safeRemaining) / 100)
+  const fillWidth = Math.round((94 * safeRemaining) / 100)
+  const labelText = label + " " + percentText
+  const fillPath = buildStadiumFillPath(1, 1, 94, 16, 8, fillWidth)
 
-  return [
+  const parts = [
     '<svg xmlns="http://www.w3.org/2000/svg" width="96" height="18" viewBox="0 0 96 18">',
-    '<rect x="0.5" y="0.5" width="95" height="17" rx="' + radius + '" fill="#ffffff" stroke="#687084"/>',
-    '<rect x="1" y="1" width="' + fillWidth + '" height="16" rx="' + (radius - 1) + '" fill="' + fillColor + '"/>',
-    '<text x="48" y="12.4" text-anchor="middle" font-family="Arial, sans-serif" font-size="9.5" fill="#1f2937">' + escapeXml(label + " " + percentText) + "</text>",
+    '<rect x="0" y="0" width="96" height="18" rx="9" fill="#687084"/>',
+    '<rect x="1" y="1" width="94" height="16" rx="8" fill="#ffffff"/>'
+  ]
+
+  if (fillPath !== null) {
+    parts.push('<path d="' + fillPath + '" fill="' + fillColor + '"/>')
+  }
+
+  parts.push(
+    '<text x="48" y="12.4" text-anchor="middle" font-family="Arial, sans-serif" font-size="9.5" fill="#1f2937">' + escapeXml(labelText) + "</text>",
     "</svg>"
-  ].join("")
+  )
+
+  return parts.join("")
+}
+
+function svgNumber(value: number): string {
+  const rounded = Math.round(value * 100) / 100
+  if (rounded === 0) {
+    return "0"
+  }
+
+  return String(rounded)
+}
+
+function buildStadiumFillPath(x: number, y: number, width: number, height: number, radius: number, fillWidth: number): string | null {
+  if (fillWidth <= 0 || width <= 0 || height <= 0) {
+    return null
+  }
+
+  const maxRadius = Math.min(radius, width / 2, height / 2)
+  const right = x + width
+  const bottom = y + height
+  const cxLeft = x + maxRadius
+  const cxRight = right - maxRadius
+  const cy = y + height / 2
+  const fillRight = Math.min(x + fillWidth, right)
+  const arc = svgNumber(maxRadius)
+
+  if (fillRight <= x) {
+    return null
+  }
+
+  if (fillWidth >= width) {
+    return (
+      "M " +
+      svgNumber(cxLeft) +
+      " " +
+      svgNumber(y) +
+      " H " +
+      svgNumber(cxRight) +
+      " A " +
+      arc +
+      " " +
+      arc +
+      " 0 0 1 " +
+      svgNumber(cxRight) +
+      " " +
+      svgNumber(bottom) +
+      " H " +
+      svgNumber(cxLeft) +
+      " A " +
+      arc +
+      " " +
+      arc +
+      " 0 0 1 " +
+      svgNumber(cxLeft) +
+      " " +
+      svgNumber(y) +
+      " Z"
+    )
+  }
+
+  if (fillRight <= cxLeft) {
+    const dx = cxLeft - fillRight
+    const chordSquare = maxRadius * maxRadius - dx * dx
+    if (chordSquare <= 0) {
+      return null
+    }
+
+    const chord = Math.sqrt(chordSquare)
+    return (
+      "M " +
+      svgNumber(fillRight) +
+      " " +
+      svgNumber(cy - chord) +
+      " L " +
+      svgNumber(fillRight) +
+      " " +
+      svgNumber(cy + chord) +
+      " A " +
+      arc +
+      " " +
+      arc +
+      " 0 0 1 " +
+      svgNumber(fillRight) +
+      " " +
+      svgNumber(cy - chord) +
+      " Z"
+    )
+  }
+
+  if (fillRight < cxRight) {
+    return (
+      "M " +
+      svgNumber(cxLeft) +
+      " " +
+      svgNumber(y) +
+      " H " +
+      svgNumber(fillRight) +
+      " V " +
+      svgNumber(bottom) +
+      " H " +
+      svgNumber(cxLeft) +
+      " A " +
+      arc +
+      " " +
+      arc +
+      " 0 0 1 " +
+      svgNumber(cxLeft) +
+      " " +
+      svgNumber(y) +
+      " Z"
+    )
+  }
+
+  const dx = fillRight - cxRight
+  const chordSquare = maxRadius * maxRadius - dx * dx
+  if (chordSquare <= 0) {
+    return (
+      "M " +
+      svgNumber(cxLeft) +
+      " " +
+      svgNumber(y) +
+      " H " +
+      svgNumber(cxRight) +
+      " A " +
+      arc +
+      " " +
+      arc +
+      " 0 0 1 " +
+      svgNumber(cxRight) +
+      " " +
+      svgNumber(bottom) +
+      " H " +
+      svgNumber(cxLeft) +
+      " A " +
+      arc +
+      " " +
+      arc +
+      " 0 0 1 " +
+      svgNumber(cxLeft) +
+      " " +
+      svgNumber(y) +
+      " Z"
+    )
+  }
+
+  const chord = Math.sqrt(chordSquare)
+  return (
+    "M " +
+    svgNumber(cxLeft) +
+    " " +
+    svgNumber(y) +
+    " H " +
+    svgNumber(cxRight) +
+    " A " +
+    arc +
+    " " +
+    arc +
+    " 0 0 1 " +
+    svgNumber(fillRight) +
+    " " +
+    svgNumber(cy - chord) +
+    " L " +
+    svgNumber(fillRight) +
+    " " +
+    svgNumber(cy + chord) +
+    " A " +
+    arc +
+    " " +
+    arc +
+    " 0 0 1 " +
+    svgNumber(cxRight) +
+    " " +
+    svgNumber(bottom) +
+    " H " +
+    svgNumber(cxLeft) +
+    " A " +
+    arc +
+    " " +
+    arc +
+    " 0 0 1 " +
+    svgNumber(cxLeft) +
+    " " +
+    svgNumber(y) +
+    " Z"
+  )
 }
 
 function getProgressFillColor(remaining: number | null): string {
