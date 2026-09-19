@@ -193,6 +193,15 @@
           "Width": 240
         }
       }
+    },
+    {
+      "Type": "checkbox",
+      "Value": {
+        "Key": "barFillsAsUsed",
+        "Label": "Fill progress bars as quota is used",
+        "DefaultValue": "false",
+        "Tooltip": "When enabled, bars fill up as the quota is consumed and show the used percentage. When disabled, bars drain as the quota is consumed and show the remaining percentage."
+      }
     }
   ]
 }

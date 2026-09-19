@@ -30,6 +30,10 @@ import {
 import { CachedGrokUsageProvider, getGrokRemainingPercent, GrokPeriodType, GrokUsageProvider, GrokUsageSnapshot, shouldShowGrokReset, shouldShowGrokResult } from "./grok-usage"
 import { CLAUDE_ICON, CODEX_ICON, CURSOR_ICON, GROK_BOT_ICON, GROK_ICON } from "./icons"
 
+export type BarFillMode = "remaining" | "used"
+
+const DEFAULT_BAR_FILL_MODE: BarFillMode = "remaining"
+
 interface LocaleStrings {
   subtitleNoLiveData: string
   subtitleFallback: string
@@ -289,6 +293,7 @@ export function resolveUsageFilter(query: Pick<Query, "Search"> & { Command?: st
 
 export async function buildResults(snapshot: CodexUsageSnapshot, api: PublicAPI, ctx: Context, provider: UsageProvider): Promise<Result[]> {
   const strings = await readLocaleStrings(api, ctx)
+  const barMode = await readBarFillMode(api, ctx)
   const subtitle = buildOverviewSubtitle(snapshot, strings)
   const summaryText = buildSummaryText(snapshot, strings, subtitle)
   const rawText = JSON.stringify(snapshot, null, 2)
@@ -327,7 +332,7 @@ export async function buildResults(snapshot: CodexUsageSnapshot, api: PublicAPI,
           Title: formatTemplate(strings.namedUsageTitle, strings.groupCodex, label),
           SubTitle: subtitle,
           Icon: CODEX_ICON,
-          Tails: [buildProgressTail(label, windows[index])],
+          Tails: [buildProgressTail(label, windows[index], barMode)],
           Actions: commonActions
         },
         group,
@@ -341,6 +346,7 @@ export async function buildResults(snapshot: CodexUsageSnapshot, api: PublicAPI,
 
 export async function buildClaudeResults(snapshot: ClaudeUsageSnapshot, api: PublicAPI, ctx: Context, provider: ClaudeUsageProvider): Promise<Result[]> {
   const strings = await readLocaleStrings(api, ctx)
+  const barMode = await readBarFillMode(api, ctx)
   const group = usageGroup(strings.groupClaude, 95)
   const actions = buildClaudeActions(api, ctx, provider)
 
@@ -375,7 +381,7 @@ export async function buildClaudeResults(snapshot: ClaudeUsageSnapshot, api: Pub
           Title: formatTemplate(strings.namedUsageTitle, strings.groupClaude, label),
           SubTitle: buildClaudeWindowSubtitle(planName, window, strings),
           Icon: CLAUDE_ICON,
-          Tails: [buildRemainingProgressTail(claudeBarLabel(window, strings), getClaudeRemainingPercent(window.usedPercent))],
+          Tails: [buildRemainingProgressTail(claudeBarLabel(window, strings), getClaudeRemainingPercent(window.usedPercent), barMode)],
           Actions: actions
         },
         group,
@@ -393,7 +399,7 @@ export async function buildClaudeResults(snapshot: ClaudeUsageSnapshot, api: Pub
           Title: formatTemplate(strings.namedUsageTitle, strings.groupClaude, strings.windowClaudeExtra),
           SubTitle: planName + " · " + extra,
           Icon: CLAUDE_ICON,
-          Tails: [buildRemainingProgressTail(strings.windowClaudeExtra, getClaudeExtraRemainingPercent(snapshot.extraUsage))],
+          Tails: [buildRemainingProgressTail(strings.windowClaudeExtra, getClaudeExtraRemainingPercent(snapshot.extraUsage), barMode)],
           Actions: actions
         },
         group,
@@ -424,6 +430,7 @@ export async function buildClaudeResults(snapshot: ClaudeUsageSnapshot, api: Pub
 
 export async function buildGrokResults(snapshot: GrokUsageSnapshot, api: PublicAPI, ctx: Context, provider: GrokUsageProvider): Promise<Result[]> {
   const strings = await readLocaleStrings(api, ctx)
+  const barMode = await readBarFillMode(api, ctx)
   const group = usageGroup(strings.groupGrok, 80)
   const actions = buildGrokActions(api, ctx, provider)
 
@@ -456,7 +463,7 @@ export async function buildGrokResults(snapshot: GrokUsageSnapshot, api: PublicA
           Title: formatTemplate(strings.namedUsageTitle, strings.groupGrok, periodLabel),
           SubTitle: formatTemplate(strings.grokPeriodReset, planName, periodLabel, formatRelativeResetAt(snapshot.billingCycleEnd, strings)),
           Icon: GROK_ICON,
-          Tails: [buildRemainingProgressTail(periodLabel, remaining)],
+          Tails: [buildRemainingProgressTail(periodLabel, remaining, barMode)],
           Actions: actions
         },
         group,
@@ -480,7 +487,7 @@ export async function buildGrokResults(snapshot: GrokUsageSnapshot, api: PublicA
           Title: formatTemplate(strings.namedUsageTitle, strings.groupGrok, label),
           SubTitle: formatTemplate(strings.planResetIn, planName, formatRelativeResetAt(snapshot.billingCycleEnd, strings)),
           Icon: GROK_ICON,
-          Tails: [buildRemainingProgressTail(label, productRemaining)],
+          Tails: [buildRemainingProgressTail(label, productRemaining, barMode)],
           Actions: actions
         },
         group,
@@ -511,6 +518,7 @@ export async function buildGrokResults(snapshot: GrokUsageSnapshot, api: PublicA
 
 export async function buildGrokBotResults(snapshot: CursorUsageSnapshot, api: PublicAPI, ctx: Context, provider: CursorUsageProvider): Promise<Result[]> {
   const strings = await readLocaleStrings(api, ctx)
+  const barMode = await readBarFillMode(api, ctx)
 
   return [
     groupedResult(
@@ -519,7 +527,7 @@ export async function buildGrokBotResults(snapshot: CursorUsageSnapshot, api: Pu
         Title: "i18n:grok_bot_result_title",
         SubTitle: buildGrokBotSubtitle(snapshot.sandUsage, snapshot.planName, strings),
         Icon: GROK_BOT_ICON,
-        Tails: buildGrokBotTails(snapshot.sandUsage, strings),
+        Tails: buildGrokBotTails(snapshot.sandUsage, strings, barMode),
         Actions: buildCursorActions(api, ctx, provider)
       },
       usageGroup(strings.groupGrok, 80),
@@ -530,6 +538,7 @@ export async function buildGrokBotResults(snapshot: CursorUsageSnapshot, api: Pu
 
 export async function buildCursorResults(snapshot: CursorUsageSnapshot, api: PublicAPI, ctx: Context, provider: CursorUsageProvider): Promise<Result[]> {
   const strings = await readLocaleStrings(api, ctx)
+  const barMode = await readBarFillMode(api, ctx)
   const group = usageGroup(strings.groupCursor, 90)
   const actions = buildCursorActions(api, ctx, provider)
   const subtitle = buildCursorSubtitle(snapshot, strings)
@@ -560,7 +569,7 @@ export async function buildCursorResults(snapshot: CursorUsageSnapshot, api: Pub
           Title: formatTemplate(strings.namedUsageTitle, strings.groupCursor, strings.windowRequestsTitle),
           SubTitle: subtitle,
           Icon: CURSOR_ICON,
-          Tails: [buildRemainingProgressTail(strings.windowRequests, getRequestRemainingPercent(snapshot.requestUsage))],
+          Tails: [buildRemainingProgressTail(strings.windowRequests, getRequestRemainingPercent(snapshot.requestUsage), barMode)],
           Actions: actions
         },
         group,
@@ -580,7 +589,7 @@ export async function buildCursorResults(snapshot: CursorUsageSnapshot, api: Pub
           Title: formatTemplate(strings.namedUsageTitle, strings.groupCursor, strings.windowCursorModelsTitle),
           SubTitle: subtitle,
           Icon: CURSOR_ICON,
-          Tails: [buildRemainingProgressTail(strings.windowCursorModels, cursorRemaining)],
+          Tails: [buildRemainingProgressTail(strings.windowCursorModels, cursorRemaining, barMode)],
           Actions: actions
         },
         group,
@@ -597,7 +606,7 @@ export async function buildCursorResults(snapshot: CursorUsageSnapshot, api: Pub
           Title: formatTemplate(strings.namedUsageTitle, strings.groupCursor, strings.windowOtherModelsTitle),
           SubTitle: subtitle,
           Icon: CURSOR_ICON,
-          Tails: [buildRemainingProgressTail(strings.windowOtherModels, otherRemaining)],
+          Tails: [buildRemainingProgressTail(strings.windowOtherModels, otherRemaining, barMode)],
           Actions: actions
         },
         group,
@@ -614,7 +623,7 @@ export async function buildCursorResults(snapshot: CursorUsageSnapshot, api: Pub
           Title: "i18n:cursor_result_title",
           SubTitle: subtitle,
           Icon: CURSOR_ICON,
-          Tails: [buildRemainingProgressTail(strings.windowLimit, clamp(Math.round(100 - snapshot.planUsage.totalPercentUsed), 0, 100))],
+          Tails: [buildRemainingProgressTail(strings.windowLimit, clamp(Math.round(100 - snapshot.planUsage.totalPercentUsed), 0, 100), barMode)],
           Actions: actions
         },
         group,
@@ -772,13 +781,13 @@ function buildGrokBotSubtitle(sandUsage: CursorSandUsage | null, planName: strin
   return formatTemplate(strings.grokBotWeekReset, name, formatRelativeResetAt(sandUsage !== null ? sandUsage.resetAt : null, strings))
 }
 
-function buildGrokBotTails(sandUsage: CursorSandUsage | null, strings: LocaleStrings): ResultTail[] {
+function buildGrokBotTails(sandUsage: CursorSandUsage | null, strings: LocaleStrings, mode: BarFillMode): ResultTail[] {
   const remaining = getGrokBotRemainingPercent(sandUsage)
   if (remaining === null) {
     return []
   }
 
-  return [buildRemainingProgressTail(strings.windowGrokBot, remaining)]
+  return [buildRemainingProgressTail(strings.windowGrokBot, remaining, mode)]
 }
 
 function grokPeriodLabel(periodType: GrokPeriodType, strings: LocaleStrings): string {
@@ -869,12 +878,12 @@ function slugify(value: string): string {
   return slug.length > 0 ? slug : "window"
 }
 
-function buildProgressTail(label: string, window: RateLimitWindowInfo | null): ResultTail {
-  return buildRemainingProgressTail(label, getRemainingPercent(window))
+function buildProgressTail(label: string, window: RateLimitWindowInfo | null, mode: BarFillMode): ResultTail {
+  return buildRemainingProgressTail(label, getRemainingPercent(window), mode)
 }
 
-function buildRemainingProgressTail(label: string, remaining: number | null): ResultTail {
-  const svg = renderProgressSvg(label, remaining)
+function buildRemainingProgressTail(label: string, remaining: number | null, mode: BarFillMode): ResultTail {
+  const svg = renderProgressSvg(label, remaining, mode)
 
   return {
     Type: "image",
@@ -887,11 +896,12 @@ function buildRemainingProgressTail(label: string, remaining: number | null): Re
   }
 }
 
-function renderProgressSvg(label: string, remaining: number | null): string {
-  const percentText = remaining === null ? "--" : String(Math.round(remaining)) + "%"
-  const safeRemaining = remaining === null ? 0 : clamp(remaining, 0, 100)
+function renderProgressSvg(label: string, remaining: number | null, mode: BarFillMode): string {
+  const shownPercent = resolveShownPercent(remaining, mode)
+  const percentText = shownPercent === null ? "--" : String(Math.round(shownPercent)) + "%"
   const fillColor = getProgressFillColor(remaining)
-  const fillWidth = Math.round((94 * safeRemaining) / 100)
+  const safePercent = shownPercent === null ? 0 : shownPercent
+  const fillWidth = Math.round((94 * safePercent) / 100)
   const labelText = label + " " + percentText
   const fillPath = buildStadiumFillPath(1, 1, 94, 16, 8, fillWidth)
 
@@ -1095,6 +1105,18 @@ function buildStadiumFillPath(x: number, y: number, width: number, height: numbe
     svgNumber(y) +
     " Z"
   )
+}
+
+function resolveShownPercent(remaining: number | null, mode: BarFillMode): number | null {
+  if (remaining === null) {
+    return null
+  }
+
+  if (mode === "used") {
+    return clamp(100 - remaining, 0, 100)
+  }
+
+  return clamp(remaining, 0, 100)
 }
 
 function getProgressFillColor(remaining: number | null): string {
@@ -1530,6 +1552,32 @@ async function readLocaleStrings(api: PublicAPI, ctx: Context): Promise<LocaleSt
     unitMinuteShort: await translate(api, ctx, "unit_minute_short", DEFAULT_LOCALE_STRINGS.unitMinuteShort),
     durationJoiner: await translate(api, ctx, "duration_joiner", DEFAULT_LOCALE_STRINGS.durationJoiner)
   }
+}
+
+async function readStringSetting(api: PublicAPI, ctx: Context, key: string, fallback: string): Promise<string> {
+  if (typeof api.GetSetting !== "function") {
+    return fallback
+  }
+
+  try {
+    const value = await api.GetSetting(ctx, key)
+    if (typeof value === "string" && value.trim().length > 0) {
+      return value.trim()
+    }
+  } catch {
+    return fallback
+  }
+
+  return fallback
+}
+
+async function readBarFillMode(api: PublicAPI, ctx: Context): Promise<BarFillMode> {
+  const raw = await readStringSetting(api, ctx, "barFillsAsUsed", "false")
+  if (raw.toLowerCase() === "true") {
+    return "used"
+  }
+
+  return DEFAULT_BAR_FILL_MODE
 }
 
 async function translate(api: PublicAPI, ctx: Context, key: string, fallback: string): Promise<string> {
