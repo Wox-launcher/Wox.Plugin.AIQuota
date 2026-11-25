@@ -1,6 +1,16 @@
 import { Context, Plugin, PluginInitParams, PublicAPI, Query, Result, ResultAction, ResultTail } from "@wox-launcher/wox-plugin"
 
-import { CachedCodexUsageProvider, CodexUsageSnapshot, CodexWindowLabels, listCodexWindows, RateLimitWindowInfo, resolveCodexPlanName, resolveCodexWindowLabel, shouldShowCodexResult, UsageProvider } from "./codex-usage"
+import {
+  CachedCodexUsageProvider,
+  CodexUsageSnapshot,
+  CodexWindowLabels,
+  listCodexWindows,
+  RateLimitWindowInfo,
+  resolveCodexPlanName,
+  resolveCodexWindowLabel,
+  shouldShowCodexResult,
+  UsageProvider
+} from "./codex-usage"
 import {
   CachedCursorUsageProvider,
   CursorSandUsage,
@@ -28,6 +38,7 @@ import {
   shouldShowClaudeResult
 } from "./claude-usage"
 import { CachedGrokUsageProvider, getGrokRemainingPercent, GrokPeriodType, GrokUsageProvider, GrokUsageSnapshot, shouldShowGrokReset, shouldShowGrokResult } from "./grok-usage"
+import { AntigravitySnapshot, CachedAntigravityUsageProvider } from "./antigravity-usage"
 import { CLAUDE_ICON, CODEX_ICON, CURSOR_ICON, GROK_BOT_ICON, GROK_ICON } from "./icons"
 
 export type BarFillMode = "remaining" | "used"
@@ -142,6 +153,7 @@ export class AIQuotaPlugin implements Plugin {
   private cursorProvider: CursorUsageProvider
   private grokProvider: GrokUsageProvider
   private claudeProvider: ClaudeUsageProvider
+  private antigravityProvider = new CachedAntigravityUsageProvider()
 
   constructor(provider?: UsageProvider, cursorProvider?: CursorUsageProvider, grokProvider?: GrokUsageProvider, claudeProvider?: ClaudeUsageProvider) {
     this.provider = provider || new CachedCodexUsageProvider()
@@ -158,6 +170,7 @@ export class AIQuotaPlugin implements Plugin {
     await this.cursorProvider.start(ctx, this.api)
     await this.grokProvider.start(ctx, this.api)
     await this.claudeProvider.start(ctx, this.api)
+    this.antigravityProvider.start(ctx, this.api)
     await safeLog(this.api, ctx, "Info", "AI Quota plugin initialized")
   }
 
@@ -236,6 +249,16 @@ export class AIQuotaPlugin implements Plugin {
       }
     }
 
+    if (includesProvider(filter, "antigravity")) {
+      let snapshot = this.antigravityProvider.getSnapshot()
+      if (forceRefresh || (filter === "antigravity" && (snapshot === null || snapshot.status === "app_not_running"))) {
+        snapshot = await this.antigravityProvider.refresh(ctx, this.api)
+      }
+      if (snapshot !== null && (snapshot.status === "ready" || filter === "antigravity")) {
+        results.push(...(await buildAntigravityResults(snapshot, this.api, ctx, this.antigravityProvider)))
+      }
+    }
+
     return results
   }
 }
@@ -247,48 +270,24 @@ export function shouldForceRefresh(search: string): boolean {
   return normalized === "refresh" || normalized === "reload" || normalized.endsWith(" refresh") || normalized.endsWith(" reload")
 }
 
-export type UsageFilter = "all" | "codex" | "cursor" | "grok" | "claude"
+const usageProviders = ["cursor", "codex", "grok", "claude", "antigravity"] as const
 
-export function includesProvider(filter: UsageFilter, provider: Exclude<UsageFilter, "all">): boolean {
+type UsageProviderId = (typeof usageProviders)[number]
+export type UsageFilter = "all" | UsageProviderId
+
+export function includesProvider<T extends UsageProviderId>(filter: UsageFilter, provider: T): filter is "all" | T {
   return filter === "all" || filter === provider
 }
 
 export function resolveUsageFilter(query: Pick<Query, "Search"> & { Command?: string }): UsageFilter {
   const command = (query.Command || "").trim().toLowerCase()
-  if (command === "cursor") {
-    return "cursor"
-  }
-
-  if (command === "codex") {
-    return "codex"
-  }
-
-  if (command === "grok") {
-    return "grok"
-  }
-
-  if (command === "claude") {
-    return "claude"
+  const commandProvider = usageProviders.find(provider => command === provider)
+  if (commandProvider !== undefined) {
+    return commandProvider
   }
 
   const search = query.Search.trim().toLowerCase()
-  if (search === "cursor" || search.startsWith("cursor ")) {
-    return "cursor"
-  }
-
-  if (search === "codex" || search.startsWith("codex ")) {
-    return "codex"
-  }
-
-  if (search === "grok" || search.startsWith("grok ")) {
-    return "grok"
-  }
-
-  if (search === "claude" || search.startsWith("claude ")) {
-    return "claude"
-  }
-
-  return "all"
+  return usageProviders.find(provider => search === provider || search.startsWith(provider + " ")) ?? "all"
 }
 
 export async function buildResults(snapshot: CodexUsageSnapshot, api: PublicAPI, ctx: Context, provider: UsageProvider): Promise<Result[]> {
@@ -348,7 +347,7 @@ export async function buildClaudeResults(snapshot: ClaudeUsageSnapshot, api: Pub
   const strings = await readLocaleStrings(api, ctx)
   const barMode = await readBarFillMode(api, ctx)
   const group = usageGroup(strings.groupClaude, 95)
-  const actions = buildClaudeActions(api, ctx, provider)
+  const actions = buildUsageRefreshActions(api, ctx, "Claude", () => provider.refresh(ctx, api))
 
   if (snapshot.availability !== "ready") {
     return [
@@ -426,6 +425,49 @@ export async function buildClaudeResults(snapshot: ClaudeUsageSnapshot, api: Pub
   }
 
   return results
+}
+
+async function buildAntigravityResults(snapshot: AntigravitySnapshot, api: PublicAPI, ctx: Context, provider: CachedAntigravityUsageProvider): Promise<Result[]> {
+  const group = usageGroup("Antigravity", 85)
+  const icon = { ImageType: "relative", ImageData: "images/antigravity.svg" } as const
+  const actions = buildUsageRefreshActions(api, ctx, group.name, () => provider.refresh(ctx, api))
+  if (snapshot.status !== "ready") {
+    const messages = {
+      app_not_running: "Open the Antigravity App and sign in to see your quota",
+      no_live_data: "No live Antigravity usage data"
+    }
+    return [
+      groupedResult(
+        {
+          Id: "antigravity-usage-overview",
+          Title: "i18n:antigravity_result_title",
+          SubTitle: await translate(api, ctx, "antigravity_" + snapshot.status, messages[snapshot.status]),
+          Icon: icon,
+          Actions: actions
+        },
+        group,
+        85
+      )
+    ]
+  }
+
+  const strings = await readLocaleStrings(api, ctx)
+  const barMode = await readBarFillMode(api, ctx)
+  return snapshot.buckets.map((bucket, index) => {
+    const label = bucket.window === "weekly" ? strings.windowWeek : bucket.window === "5h" ? strings.windowFiveHour : strings.windowLimit
+    return groupedResult(
+      {
+        Id: "antigravity-usage-" + bucket.id,
+        Title: group.name + " · " + bucket.group,
+        SubTitle: bucket.resetsAt === null ? label : formatTemplate(strings.subtitleResetIn, label, formatRelativeResetAt(bucket.resetsAt, strings)),
+        Icon: icon,
+        Tails: [buildRemainingProgressTail(label, bucket.remainingPercent, barMode)],
+        Actions: actions
+      },
+      group,
+      85 - index
+    )
+  })
 }
 
 export async function buildGrokResults(snapshot: GrokUsageSnapshot, api: PublicAPI, ctx: Context, provider: GrokUsageProvider): Promise<Result[]> {
@@ -915,10 +957,7 @@ function renderProgressSvg(label: string, remaining: number | null, mode: BarFil
     parts.push('<path d="' + fillPath + '" fill="' + fillColor + '"/>')
   }
 
-  parts.push(
-    '<text x="48" y="12.4" text-anchor="middle" font-family="Arial, sans-serif" font-size="9.5" fill="#1f2937">' + escapeXml(labelText) + "</text>",
-    "</svg>"
-  )
+  parts.push('<text x="48" y="12.4" text-anchor="middle" font-family="Arial, sans-serif" font-size="9.5" fill="#1f2937">' + escapeXml(labelText) + "</text>", "</svg>")
 
   return parts.join("")
 }
@@ -1158,22 +1197,22 @@ function buildCursorActions(api: PublicAPI, ctx: Context, provider: CursorUsageP
   ]
 }
 
-function buildClaudeActions(api: PublicAPI, ctx: Context, provider: ClaudeUsageProvider): ResultAction[] {
+function buildUsageRefreshActions(api: PublicAPI, ctx: Context, name: string, refresh: () => Promise<unknown>): ResultAction[] {
   return [
     {
-      Id: "refresh-claude",
+      Id: "refresh-" + name.toLowerCase(),
       Name: "i18n:action_refresh",
       Icon: {
         ImageType: "svg",
-        ImageData: `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24"><path fill="#0c4cf0" d="M12 20q-3.35 0-5.675-2.325T4 12t2.325-5.675T12 4q1.725 0 3.3.712T18 6.75V4h2v7h-7V9h4.2q-.8-1.4-2.187-2.2T12 6Q9.5 6 7.75 7.75T6 12t1.75 4.25T12 18q1.925 0 3.475-1.1T17.65 14h2.1q-.7 2.65-2.85 4.325T12 20"/></svg>`
+        ImageData: `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24"><path fill="var(--wox-theme-icon-color)" d="M12 20q-3.35 0-5.675-2.325T4 12t2.325-5.675T12 4q1.725 0 3.3.712T18 6.75V4h2v7h-7V9h4.2q-.8-1.4-2.187-2.2T12 6Q9.5 6 7.75 7.75T6 12t1.75 4.25T12 18q1.925 0 3.475-1.1T17.65 14h2.1q-.7 2.65-2.85 4.325T12 20"/></svg>`
       },
       PreventHideAfterAction: true,
       Action: async actionCtx => {
-        await safeLog(api, ctx, "Info", "Refreshing Claude usage")
+        await safeLog(api, ctx, "Info", "Refreshing " + name + " usage")
         try {
-          await provider.refresh(ctx, api)
+          await refresh()
         } catch (error) {
-          await safeLog(api, ctx, "Warning", "Manual Claude usage refresh failed: " + (error instanceof Error ? error.message : String(error)))
+          await safeLog(api, ctx, "Warning", "Manual " + name + " usage refresh failed: " + (error instanceof Error ? error.message : String(error)))
         }
         if (typeof api.RefreshQuery === "function") {
           await api.RefreshQuery(actionCtx, {
